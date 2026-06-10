@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AI 驱动的竞品分析 Agent 协作系统 - 新一版</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v='__APP_VERSION__') }}">
+    <script src="{{ url_for('static', filename='app.js', v='__APP_VERSION__') }}" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="history-sidebar">
+        <div class="history-brand-row">
+          <button class="brand history-brand" id="homeButton" type="button">竞品分析Agent</button>
+          <button class="new-chat-button" id="newChatButton" type="button">开始新对话</button>
+        </div>
+        <div class="history-heading">
+          <span>分析记录</span>
+          <button class="mini-button" id="refreshHistoryButton" type="button">刷新</button>
+        </div>
+        <div class="history-tabs" role="tablist" aria-label="历史任务分组">
+          <button class="history-tab active" id="historyTabButton" type="button">历史</button>
+          <button class="history-tab" id="archiveTabButton" type="button">归档</button>
+        </div>
+        <div class="history-list" id="historyList">
+          <p class="history-empty">正在读取历史任务...</p>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div class="topbar-status" aria-hidden="true"></div>
+          <nav class="nav-actions">
+            <button class="nav-tab hidden" id="boardNavButton" type="button">任务看板</button>
+            <button class="nav-tab hidden" id="reportNavButton" type="button">查看报告</button>
+            <button class="primary small hidden" id="manualTopButton" type="button">人工复查/补充材料</button>
+          </nav>
+        </header>
+
+        <main>
+          <section id="createView" class="view create-view">
+            <form id="taskForm" class="create-panel chat-create-panel">
+              <div class="panel-heading chat-heading">
+                <p class="eyebrow">新分析任务</p>
+                <h1>Hi~今天想分析点什么？</h1>
+              </div>
+
+              <div class="chat-composer" id="chatComposer">
+                <div class="source-menu-wrap">
+                  <button class="add-source-button" id="sourceMenuButton" type="button" aria-expanded="false" aria-label="添加来源">+</button>
+                  <div class="source-menu hidden" id="sourceMenu">
+                    <button type="button" id="onlineSearchButton">联网搜索</button>
+                    <button type="button" id="uploadMenuButton">上传文件</button>
+                    <button type="button" id="questionnaireMenuButton">问卷调研</button>
+                  </div>
+                </div>
+                <textarea id="taskPromptInput" rows="1" required maxlength="600" placeholder="输入产品名即可，例如：chatgpt、豆包；也可以补充官网 URL"></textarea>
+                <button class="primary send-button" id="startButton" type="submit">开始分析</button>
+              </div>
+
+              <div class="composer-meta">
+                <span class="source-status" id="sourceModeStatus">数据来源：缓存样例</span>
+                <span class="input-feedback" id="inputFeedback">默认不联网搜索，可通过 + 上传材料或手动开启联网搜索。</span>
+              </div>
+              <div class="upload-chips hidden" id="uploadChips" aria-label="已选上传材料"></div>
+
+              <fieldset class="focus-options focus-checks" id="focusOptions">
+                <legend>分析维度</legend>
+                <label><input type="checkbox" value="市场与赛道" checked> 市场与赛道</label>
+                <label><input type="checkbox" value="竞品分层" checked> 竞品分层</label>
+                <label><input type="checkbox" value="核心能力" checked> 核心能力</label>
+                <label><input type="checkbox" value="商业模式与定价" checked> 商业模式与定价</label>
+                <label><input type="checkbox" value="增长与分发" checked> 增长与分发</label>
+                <label><input type="checkbox" value="用户与场景" checked> 用户与场景</label>
+                <label><input type="checkbox" value="SWOT与壁垒" checked> SWOT 与壁垒</label>
+                <label><input type="checkbox" value="机会建议" checked> 机会建议</label>
+              </fieldset>
+
+              <input class="visually-hidden" id="uploadInput" type="file" accept=".txt,.md,.csv,.json,.pdf" multiple>
+            </form>
+          </section>
+
+          <section id="boardView" class="view hidden">
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">过程回放</p>
+            <h1 id="taskTitle">任务看板</h1>
+          </div>
+          <div class="head-meta">
+            <span class="status-pill" id="taskStatus">等待中</span>
+            <span id="taskElapsed">0 秒</span>
+            <button class="ghost" id="editTaskButton" type="button">修改任务</button>
+            <button class="ghost danger hidden" id="stopTaskButton" type="button">停止任务</button>
+            <button class="ghost" id="toggleLogsButton" type="button">查看日志</button>
+          </div>
+        </div>
+
+        <div class="dag-layout">
+          <div class="dag-canvas" id="dagCanvas"></div>
+          <aside class="board-side-rail">
+            <section class="inline-plan-card" id="inlinePlanCard">
+              <div class="inline-plan-head">
+                <strong>任务执行计划</strong>
+                <span id="inlinePlanSummary">等待开始</span>
+              </div>
+              <ol id="inlinePlanSteps"></ol>
+            </section>
+            <section class="qa-card" id="qaCard"></section>
+          </aside>
+        </div>
+      </section>
+
+          <section id="reportView" class="view hidden">
+        <div class="page-head report-head">
+          <div>
+            <p class="eyebrow">结构化报告</p>
+            <h1 id="reportTitle">竞品分析报告</h1>
+          </div>
+          <div class="head-meta">
+            <span id="reportGenerated">生成中</span>
+            <span id="reportConfidence" class="status-pill">可信度 0%</span>
+            <span id="reportSources">来源 0</span>
+            <span id="reportQa" class="status-pill pass">质检通过</span>
+            <button class="ghost" id="downloadPdfButton" type="button">下载 PDF</button>
+            <button class="ghost hidden" id="toggleReportModeButton" type="button" aria-hidden="true">完整版报告</button>
+          </div>
+        </div>
+        <div id="reportMetrics" class="report-metrics hidden"></div>
+        <div id="reportBoards" class="report-grid hidden"></div>
+        <article id="fullReport" class="full-report"></article>
+      </section>
+        </main>
+      </div>
+    </div>
+
+    <aside class="floating-plan hidden" id="floatingPlan">
+      <div class="drag-handle">
+        <strong>任务执行计划</strong>
+        <button id="collapsePlanButton" type="button" aria-label="收起任务计划">−</button>
+      </div>
+      <div id="planContent">
+        <ol id="planSteps"></ol>
+      </div>
+    </aside>
+    <button class="plan-chip hidden" id="planChip" type="button">执行计划</button>
+
+    <button class="research-float-ball" id="researchFloatBall" type="button" title="用户调研">用户调研</button>
+
+    <aside class="research-panel hidden" id="researchPanel">
+      <div class="drag-handle research-panel-drag">
+        <strong>调研小助手</strong>
+        <button id="closeResearchPanelButton" type="button" aria-label="关闭调研助手">×</button>
+      </div>
+      <div class="research-tabs">
+        <button class="research-tab active" id="questionnaireTabButton" type="button">生成问卷</button>
+        <button class="research-tab" id="interviewTabButton" type="button">访谈提纲</button>
+      </div>
+      <div class="research-body">
+        <p class="research-context-hint" id="researchContextHint">可基于当前任务生成问卷或访谈提纲。</p>
+        <form id="researchForm">
+          <textarea id="researchObjective" rows="3" required maxlength="500" placeholder="描述调研目标，系统将自动生成对应问卷或访谈提纲。&#10;例如：了解开发者对 Copilot 和 Cursor 的功能偏好与切换意愿"></textarea>
+          <div class="research-form-extra" id="researchFormExtra">
+            <input id="researchTargetUsers" maxlength="300" placeholder="目标用户画像（选填），如：有2年以上AI编程工具使用经验的中级开发者">
+            <label class="research-count-field" id="researchInterviewCountWrap">
+              <span>预计访谈人数</span>
+              <input id="researchInterviewCount" type="number" value="5" min="1" max="20">
+            </label>
+          </div>
+          <button class="primary small" id="researchSubmitButton" type="submit">生成</button>
+        </form>
+        <div class="research-result hidden" id="researchResult"></div>
+      </div>
+    </aside>
+
+    <aside class="side-panel hidden" id="logPanel">
+      <div class="panel-drag">
+        <strong>智能体运行日志</strong>
+        <div class="panel-actions">
+          <button id="downloadLogsButton" type="button">下载</button>
+          <button id="closeLogsButton" type="button" aria-label="关闭日志">×</button>
+        </div>
+      </div>
+      <div class="log-filters">
+        <label class="field compact">
+          <span>智能体筛选</span>
+          <select id="logFilter">
+            <option value="">全部智能体</option>
+            <option>采集 Agent</option>
+            <option>访谈/问卷整理 Agent</option>
+            <option>分析 Agent</option>
+            <option>质检 Agent</option>
+            <option>报告 Agent</option>
+          </select>
+        </label>
+        <label class="field compact">
+          <span>状态</span>
+          <select id="logStatusFilter">
+            <option value="">全部状态</option>
+            <option value="completed">已完成</option>
+            <option value="rejected">被打回</option>
+            <option value="rerun_completed">重做完成</option>
+            <option value="failed">失败</option>
+          </select>
+        </label>
+        <label class="field compact">
+          <span>严重级别</span>
+          <select id="logSeverityFilter">
+            <option value="">全部级别</option>
+            <option value="info">普通</option>
+            <option value="warning">提醒</option>
+            <option value="error">错误</option>
+          </select>
+        </label>
+        <label class="field compact">
+          <span>打回</span>
+          <select id="logReworkFilter">
+            <option value="">全部</option>
+            <option value="1">仅打回/重做</option>
+            <option value="0">非打回</option>
+          </select>
+        </label>
+      </div>
+      <div id="logList" class="timeline"></div>
+    </aside>
+
+    <aside class="side-panel sources-panel hidden" id="sourcesPanel">
+      <div class="panel-drag">
+        <strong>来源追溯</strong>
+        <button id="closeSourcesButton" type="button" aria-label="关闭来源">×</button>
+      </div>
+      <div id="sourcesTableWrap"></div>
+    </aside>
+
+    <div class="modal-backdrop hidden" id="modalBackdrop">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <div class="modal-head">
+          <h2 id="modalTitle">查看详情</h2>
+          <button id="closeModalButton" type="button" aria-label="关闭弹窗">×</button>
+        </div>
+        <div id="modalBody"></div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="manualBackdrop">
+      <form class="modal manual-modal" id="manualForm" role="dialog" aria-modal="true" aria-labelledby="manualTitle">
+        <div class="modal-head">
+          <h2 id="manualTitle">人工复查/补充材料</h2>
+          <button id="closeManualButton" type="button" aria-label="关闭人工复查">×</button>
+        </div>
+        <label class="field" id="selectedTextField">
+          <span>选中文本</span>
+          <textarea id="selectedTextInput" rows="3" readonly></textarea>
+        </label>
+        <div class="manual-guide hidden" id="manualGuide"></div>
+        <label class="field">
+          <span id="manualTextLabel">复查说明</span>
+          <textarea id="manualTextInput" rows="5" required placeholder="例如：这个结论证据不够，请补充来源并重新质检"></textarea>
+        </label>
+        <button class="primary" type="submit">提交</button>
+      </form>
+    </div>
+
+    <div class="context-menu hidden" id="contextMenu">
+      <button type="button" data-action="修正结论">修正结论</button>
+      <button type="button" data-action="补充来源">补充来源</button>
+      <button type="button" data-action="要求重新搜索">要求重新搜索</button>
+      <button type="button" data-action="要求重新质检">要求重新质检</button>
+    </div>
+
+    <div class="context-menu hidden" id="historyContextMenu">
+      <button type="button" data-action="archive">归档该任务</button>
+      <button type="button" data-action="delete" class="danger">删除该任务</button>
+    </div>
+
+    <div class="modal-backdrop hidden" id="deleteBackdrop">
+      <section class="modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="deleteTitle">
+        <div class="modal-head">
+          <h2 id="deleteTitle">确认删除任务？</h2>
+          <button id="cancelDeleteTopButton" type="button" aria-label="关闭删除确认">×</button>
+        </div>
+        <p id="deleteMessage">删除后会清除报告、日志、来源、证据和 Agent 事件，无法恢复。</p>
+        <div class="confirm-actions">
+          <button class="ghost" id="cancelDeleteButton" type="button">取消</button>
+          <button class="danger-button" id="confirmDeleteButton" type="button">确认删除</button>
+        </div>
+      </section>
+    </div>
+
+  </body>
+</html>

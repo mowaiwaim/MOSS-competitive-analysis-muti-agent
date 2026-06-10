@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ design.title or "用户调研问卷" }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}">
+  </head>
+  <body class="questionnaire-page">
+    <main class="questionnaire-shell">
+      <header class="questionnaire-hero">
+        <p class="eyebrow">{{ task.industry or "用户调研" }}</p>
+        <h1>{{ design.title or "用户调研问卷" }}</h1>
+        <p>{{ design.description or "请基于你的真实体验填写。所有答案只用于本次竞品分析任务。" }}</p>
+        <div class="questionnaire-meta">
+          <span>竞品：{{ "、".join(task.competitors) if task.competitors else "未记录" }}</span>
+          <span>预计 {{ design.estimated_time_minutes or 5 }} 分钟</span>
+        </div>
+      </header>
+
+      <form class="questionnaire-form" method="post" action="{{ url_for('submit_questionnaire_response', design_id=design_id) }}">
+        <label class="questionnaire-field">
+          <span>受访者标识（选填，建议使用脱敏编号）</span>
+          <input name="respondent_label" maxlength="120" placeholder="例如：R01 / 开发者A / 用户组1">
+        </label>
+
+        {% for section in design.sections or [] %}
+          {% set section_index = loop.index %}
+          <section class="questionnaire-section">
+            <h2>{{ section.section_title or "调研模块" }}</h2>
+            {% for q in section.questions or [] %}
+              {% set question_id = q.id or ("Q" ~ section_index ~ "_" ~ loop.index) %}
+              {% set field_name = q.question_key or question_id %}
+              <fieldset class="questionnaire-question">
+                <legend>
+                  <span>{{ question_id }}</span>
+                  {{ q.question_text or "请填写你的答案" }}
+                </legend>
+                {% if q.type == "open_ended" %}
+                  <textarea name="{{ field_name }}" rows="4" {% if q.required %}required{% endif %}></textarea>
+                {% elif q.type == "multiple_choice" %}
+                  <div class="questionnaire-options">
+                    {% for option in q.options or [] %}
+                      <label>
+                        <input type="checkbox" name="{{ field_name }}" value="{{ option }}">
+                        <span>{{ option }}</span>
+                      </label>
+                    {% endfor %}
+                  </div>
+                {% elif q.type == "likert" %}
+                  <div class="questionnaire-options likert-options">
+                    {% for option in q.options or ["1", "2", "3", "4", "5"] %}
+                      <label>
+                        <input type="radio" name="{{ field_name }}" value="{{ option }}" {% if q.required %}required{% endif %}>
+                        <span>{{ option }}</span>
+                      </label>
+                    {% endfor %}
+                  </div>
+                {% else %}
+                  <div class="questionnaire-options">
+                    {% for option in q.options or [] %}
+                      <label>
+                        <input type="radio" name="{{ field_name }}" value="{{ option }}" {% if q.required %}required{% endif %}>
+                        <span>{{ option }}</span>
+                      </label>
+                    {% endfor %}
+                  </div>
+                {% endif %}
+              </fieldset>
+            {% endfor %}
+          </section>
+        {% endfor %}
+
+        <footer class="questionnaire-submit">
+          <button class="primary" type="submit">提交问卷</button>
+          <p>请勿填写手机号、邮箱、身份证号、API Key 或其他敏感信息。</p>
+        </footer>
+      </form>
+    </main>
+  </body>
+</html>

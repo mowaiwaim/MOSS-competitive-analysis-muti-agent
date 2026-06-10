@@ -1,0 +1,50 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Runtime data
+data/
+output/
+uploads/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+flask-*.out.log
+flask-*.err.log
+
+# Generated artifacts
+*.pdf
+*.zip
+*.tar
+*.tar.gz
+*.xlsx
+*.docx
+*.pptx
+
+# Python caches and virtual environments
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+venv/
+env/
+
+# Local-only reference material and copied helper packs
+测试资料/
+skills/
+启动_*.bat
+启动_*.ps1
+启动说明.md
+新一版说明.md
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

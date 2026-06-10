@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>问卷已提交</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}">
+  </head>
+  <body class="questionnaire-page">
+    <main class="questionnaire-shell thanks-shell">
+      <section class="questionnaire-hero">
+        <p class="eyebrow">提交成功</p>
+        <h1>感谢你的反馈</h1>
+        <p>你的回答已写入本地调研数据表，可用于后续问卷分析和竞品报告补证。</p>
+        <div class="questionnaire-meta">
+          <span>{{ title }}</span>
+          <span>回执：{{ response_id[:8] }}</span>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
