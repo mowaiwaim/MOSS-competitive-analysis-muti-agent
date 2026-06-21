@@ -47,8 +47,6 @@ http://127.0.0.1:5016
 
 ## 环境变量
 
-请不要把 `.env` 提交到 GitHub。公开仓库只保留 `.env.example`。
-
 主要配置：
 
 - `REACT_AGENT_PROVIDER=auto`
