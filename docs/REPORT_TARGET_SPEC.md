@@ -1,4 +1,4 @@
-# 第五版报告形态目标规格
+# MOSS多agent智能竞品分析系统——小莫报告形态目标规格
 
 参考标杆：`ChatGPT_vs_DeepSeek_competitive_analysis_2026-05-27.pdf`。
 

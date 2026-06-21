@@ -16,6 +16,7 @@ from schema import LLMClaimDraft
 
 DEFAULT_DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_DOUBAO_MODEL_NAME = "Doubao-Seed-2.0-lite"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 
 class LLMProviderError(RuntimeError):
@@ -323,16 +324,27 @@ def extract_json_payload(text: str) -> Any:
 class LLMProvider:
     def __init__(self) -> None:
         configured = os.environ.get("LLM_PROVIDER", "").strip().lower()
+        self.configured_provider = configured
         self.provider = configured or ("doubao" if os.environ.get("DOUBAO_API_KEY") else "mock")
         self.api_key = os.environ.get("DOUBAO_API_KEY", "")
         self.endpoint_id = os.environ.get("DOUBAO_ENDPOINT_ID", "")
         self.model_name = os.environ.get("DOUBAO_MODEL_NAME", DEFAULT_DOUBAO_MODEL_NAME)
         self.model_id = self.endpoint_id or os.environ.get("DOUBAO_MODEL_NAME", "")
         self.base_url = os.environ.get("DOUBAO_BASE_URL", DEFAULT_DOUBAO_BASE_URL).rstrip("/")
+        self.deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        self.deepseek_model_id = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        self.deepseek_base_url = os.environ.get("DEEPSEEK_API_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/")
         try:
             self.timeout_seconds = max(5, min(60, int(os.environ.get("DOUBAO_TIMEOUT_SECONDS", "20"))))
         except ValueError:
             self.timeout_seconds = 20
+        try:
+            self.deepseek_timeout_seconds = max(5, min(90, int(os.environ.get("DEEPSEEK_RESEARCH_TIMEOUT_SECONDS", "45"))))
+        except ValueError:
+            self.deepseek_timeout_seconds = 45
+
+    def _use_deepseek_for_research_generation(self) -> bool:
+        return bool(self.deepseek_api_key and self.deepseek_model_id and self.configured_provider != "mock")
 
     def generate_claims(self, task: dict[str, Any], evidence: list[dict[str, Any]]) -> LLMResult:
         prompt = build_prompt(task, evidence)
@@ -501,7 +513,22 @@ class LLMProvider:
     ) -> LLMJSONResult:
         dims = dimensions or task.get("focus_areas", ["功能对比", "定价", "用户评价", "用户画像", "SWOT"])
         prompt = build_questionnaire_design_prompt(task, research_objective, target_users, dims)
-        if self.provider != "doubao":
+        deepseek_error = ""
+        if self._use_deepseek_for_research_generation():
+            try:
+                payload = self._deepseek_chat_json(prompt, timeout=self.deepseek_timeout_seconds)
+                if not isinstance(payload.get("sections"), list):
+                    raise LLMProviderError("deepseek questionnaire design schema validation failed")
+                return LLMJSONResult(
+                    provider="deepseek",
+                    data=payload,
+                    input_tokens=estimate_tokens(prompt),
+                    output_tokens=estimate_tokens(json.dumps(payload, ensure_ascii=False)),
+                    tool_calls=[{"name": "deepseek_chat_completions", "result": "questionnaire_design"}],
+                )
+            except LLMProviderError as exc:
+                deepseek_error = f"DeepSeek questionnaire generation failed: {exc}; using local template."
+        if self.provider != "doubao" or deepseek_error:
             competitors = [str(item) for item in task.get("competitors", []) if str(item).strip()]
             competitor_label = "、".join(competitors) or "目标竞品"
             dim_options = [str(item) for item in dims[:6]]
@@ -580,7 +607,7 @@ class LLMProvider:
                 input_tokens=estimate_tokens(prompt),
                 output_tokens=estimate_tokens(research_objective) + 80,
                 used_fallback=True,
-                fallback_reason="未配置豆包，使用本地问卷大纲模板。",
+                fallback_reason=deepseek_error or "未配置豆包，使用本地问卷大纲模板。",
                 tool_calls=[{"name": "mock_questionnaire_design", "result": "local outline"}],
             )
         payload = self._chat_json(prompt, timeout=self.timeout_seconds + 10)
@@ -629,7 +656,22 @@ class LLMProvider:
         target_users: str = "", interview_count: int = 5,
     ) -> LLMJSONResult:
         prompt = build_interview_guide_prompt(task, research_objective, target_users, interview_count)
-        if self.provider != "doubao":
+        deepseek_error = ""
+        if self._use_deepseek_for_research_generation():
+            try:
+                payload = self._deepseek_chat_json(prompt, timeout=self.deepseek_timeout_seconds)
+                if not isinstance(payload.get("phases"), list):
+                    raise LLMProviderError("deepseek interview guide schema validation failed")
+                return LLMJSONResult(
+                    provider="deepseek",
+                    data=payload,
+                    input_tokens=estimate_tokens(prompt),
+                    output_tokens=estimate_tokens(json.dumps(payload, ensure_ascii=False)),
+                    tool_calls=[{"name": "deepseek_chat_completions", "result": "interview_guide"}],
+                )
+            except LLMProviderError as exc:
+                deepseek_error = f"DeepSeek interview guide generation failed: {exc}; using local template."
+        if self.provider != "doubao" or deepseek_error:
             competitors = "、".join(task.get("competitors", [])) or "目标竞品"
             return LLMJSONResult(
                 provider="mock",
@@ -680,7 +722,7 @@ class LLMProvider:
                 input_tokens=estimate_tokens(prompt),
                 output_tokens=estimate_tokens(research_objective) + 90,
                 used_fallback=True,
-                fallback_reason="未配置豆包，使用本地访谈提纲模板。",
+                fallback_reason=deepseek_error or "未配置豆包，使用本地访谈提纲模板。",
                 tool_calls=[{"name": "mock_interview_guide", "result": "local outline"}],
             )
         payload = self._chat_json(prompt, timeout=self.timeout_seconds + 10)
@@ -795,6 +837,48 @@ class LLMProvider:
             raise LLMProviderError("doubao JSON parse failed") from exc
         if not isinstance(parsed, dict):
             raise LLMProviderError("doubao response must be a JSON object")
+        return parsed
+
+    def _deepseek_chat_json(self, prompt: str, timeout: int) -> dict[str, Any]:
+        if not self.deepseek_api_key:
+            raise LLMProviderError("DEEPSEEK_API_KEY is not configured")
+        if not self.deepseek_model_id:
+            raise LLMProviderError("DEEPSEEK_MODEL is not configured")
+        request_body = {
+            "model": self.deepseek_model_id,
+            "messages": [
+                {"role": "system", "content": "你只输出合法 JSON 对象，不输出 Markdown 或额外解释。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
+        request = urllib.request.Request(
+            f"{self.deepseek_base_url}/chat/completions",
+            data=json.dumps(request_body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.deepseek_api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            raise LLMProviderError(f"deepseek HTTP {exc.code}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise LLMProviderError("deepseek timeout") from exc
+        except urllib.error.URLError as exc:
+            raise LLMProviderError(f"deepseek network error: {exc.reason}") from exc
+        except OSError as exc:
+            raise LLMProviderError(f"deepseek connection error: {exc.__class__.__name__}") from exc
+        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        try:
+            parsed = extract_json_payload(content)
+        except json.JSONDecodeError as exc:
+            raise LLMProviderError("deepseek JSON parse failed") from exc
+        if not isinstance(parsed, dict):
+            raise LLMProviderError("deepseek response must be a JSON object")
         return parsed
 
     def _generate_with_doubao(self, prompt: str, evidence: list[dict[str, Any]]) -> LLMResult:

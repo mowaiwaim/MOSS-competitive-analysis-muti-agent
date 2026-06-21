@@ -1,4 +1,4 @@
-# 第五版架构说明
+# MOSS多agent智能竞品分析系统——小莫架构说明
 
 ## 组件关系
 
@@ -7,14 +7,17 @@ flowchart LR
   UI["原生前端 SPA"] --> API["Flask API"]
   FORM["本地问卷链接 /questionnaires/:id"] --> API
   API --> DB[("SQLite")]
-  API --> ORCH["Orchestrator"]
+  API --> WF["顶层 LangGraph StateGraph"]
+  WF --> ORCH["Orchestrator 节点执行器"]
   ORCH --> C["采集 Agent"]
   ORCH --> U["访谈/问卷整理 Agent"]
   ORCH --> A["分析 Agent"]
   ORCH --> Q["质检 Agent"]
   ORCH --> R["报告 Agent"]
-  C --> WC["WebCollector: robots/限频/抓取"]
-  A --> LLM["LLM Provider: doubao/mock"]
+  C --> SEARCH["主采集: 火山联网搜索 / Google Alerts RSS / AppArk"]
+  C --> AUX["ReAct 辅助: DuckDuckGo / 旧 Bing / 抓页 / 截图"]
+  A --> LLM["分析 API: DeepSeek -> 智谱 -> 豆包 / mock"]
+  A --> DEEP["深度报告: DeepSeek direct thinking / 内层 StateGraph ReAct"]
   C --> DB
   U --> DB
   A --> DB
@@ -26,14 +29,14 @@ flowchart LR
 ## 数据流
 
 1. 用户提交行业、竞品、官网或 URL、关注维度和数据来源模式。
-2. Flask 写入 `tasks`、`competitors`，并同步启动 Orchestrator。
-3. 实时采集模式下，采集 Agent 调用火山联网搜索 API，写入 `sources`、`evidence_chunks` 和 `collection_runs`；失败则记录采集缺口，不回退 Bing 或无关缓存样例。
+2. Flask 写入 `tasks`、`competitors`，并启动顶层 LangGraph StateGraph；Orchestrator 作为节点执行器承载采集、分析、质检和报告的业务逻辑。
+3. 实时采集模式下，采集 Agent 以火山联网搜索、Google Alerts RSS 和 AppArk 作为主采集来源，写入 `sources`、`evidence_chunks`、`collection_runs` 和 App 市场指标；失败则记录采集缺口，不混入无关缓存样例。
 4. 上传材料由访谈/问卷整理 Agent 写入 evidence chunks，并生成带来源的结构化 claim。
 5. 问卷设计由访谈/问卷整理 Agent 写入 `questionnaire_designs` 和 `sources`，并生成 `/questionnaires/<design_id>` 本地链接；问卷提交写入 `questionnaire_responses`。
-6. 分析 Agent 先读取 evidence chunks，再调用 `doubao` 或 `mock` Provider 生成结构化草稿，随后映射到统一竞品 Schema。
-7. 质检 Agent 校验来源覆盖、Schema 完整性、低置信度、时间敏感信息、重复结论和报告准入，失败时写入 `qa_findings` 并打回。
-8. 报告 Agent 只渲染至少绑定一个 `source_id` 的结论，生成 `reports` 和 `citation_map`。
-9. 前端展示 DAG、报告、来源、evidence、Trace，并支持日志筛选、调研助手和问卷链接复制。
+6. 分析 Agent 先读取 evidence chunks，深度报告按 DeepSeek -> 智谱 -> 豆包顺序尝试已配置模型；DeepSeek direct thinking 优先，必要时使用内层 StateGraph ReAct 工具循环补证，结构化辅助能力未配置时降级到 `mock` Provider，随后映射到统一竞品 Schema。
+7. 质检 Agent 自动质检最多三轮，校验来源覆盖、Schema 完整性、低置信度、时间敏感信息、重复结论和报告准入；同类问题三次仍失败时写入 `manual_pending` 并进入人工复核工作台，报告仍继续生成且标记 `needs_review`。
+8. 报告 Agent 只渲染至少绑定一个 `source_id` 的结论，生成正式 `CompetitiveKnowledgeSchema` 覆盖功能树、定价模型、用户画像、SWOT、来源目录、方法论和图表数据；校验通过后写入 `reports` 和 `citation_map`。
+9. 前端展示 LangGraph 流程阶段图、报告、来源、evidence、Trace，并支持日志筛选、调研助手和问卷链接复制。
 
 ## 核心表
 

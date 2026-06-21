@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import operator
 import os
 import re
 import sqlite3
@@ -9,15 +10,16 @@ import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from appark_collector import APPARK_COMPETITOR_URL, collect_appark_metrics
 from collector import BingSearchClient, VolcWebSearchClient, WebCollector, WebSourceDraft, chunk_text
 from llm_provider import LLMProvider, LLMProviderError
 from react_report_agent import run_react_report
 from rss_collector import collect_google_alert_sources
-from schema import ReportableClaim, utc_now_iso
+from schema import CompetitiveKnowledgeSchema, ReportableClaim, utc_now_iso
 
 from config_loader import (
     INDUSTRY_RELATED_TERMS,
@@ -41,6 +43,34 @@ from pricing_parser import (
     pricing_claim_text_from_facts as _pricing_claim_text_from_facts,
     pricing_facts_from_source as _pricing_facts_from_source,
 )
+
+try:
+    from langgraph.graph import END as WORKFLOW_END, StateGraph as WorkflowStateGraph
+    from typing_extensions import TypedDict
+    _WORKFLOW_LANGGRAPH_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    WORKFLOW_END = "__end__"  # type: ignore[assignment]
+    WorkflowStateGraph = None  # type: ignore[assignment]
+    TypedDict = None  # type: ignore[assignment]
+    _WORKFLOW_LANGGRAPH_IMPORT_ERROR = exc
+
+WORKFLOW_ENGINE = "langgraph_stategraph"
+
+if _WORKFLOW_LANGGRAPH_IMPORT_ERROR is None:
+    class WorkflowGraphState(TypedDict, total=False):
+        task_id: str
+        dataset: dict[str, Any]
+        task_config: dict[str, Any]
+        source_map: dict[str, str]
+        qa_round: int
+        rejected_claim_id: str
+        last_failure_signature: str
+        repeated_failure_count: int
+        deep_refresh_needed: bool
+        next_node: str
+        workflow_trace: Annotated[list[dict[str, Any]], operator.add]
+else:
+    WorkflowGraphState = dict[str, Any]  # type: ignore[misc, assignment]
 
 
 SENSITIVE_PATTERNS = [
@@ -233,7 +263,7 @@ def iso(dt: datetime) -> str:
 
 
 class Orchestrator:
-    """Deterministic DAG runner with optional real collection and LLM calls."""
+    """Business executor for LangGraph workflow nodes with optional collection and LLM calls."""
 
     def __init__(self, db_path: str | Path, dataset_path: str | Path):
         self.db_path = str(db_path)
@@ -355,56 +385,19 @@ class Orchestrator:
 
     def run_initial_workflow(self, task_id: str) -> None:
         try:
-            self._ensure_not_stopped(task_id)
-            dataset = self.load_dataset()
-            task_config = self._task_config(task_id)
-            source_map: dict[str, str] = {}
-            self._log_agent_event(task_id, "编排层", "workflow_started", "已创建任务，准备进入采集、分析、质检和报告链路。")
-            source_mode = task_config.get("source_mode", "")
-            if "实时采集" in source_mode:
-                source_map.update(self._existing_user_material_source_map(task_id))
-                source_map.update(self._collect_real_sources(task_id, task_config, dataset))
-                self._ensure_not_stopped(task_id)
-                source_map.update(self._collect_manual_scope_sources(task_id, task_config, source_map))
-            elif "上传资料" in source_mode:
-                source_map.update(self._collect_user_supplied_sources(task_id, task_config))
-            else:
-                source_map.update(self._collect_sources(task_id, dataset))
-            self._ensure_not_stopped(task_id)
-            self._collect_appark_metrics_for_task(task_id, task_config.get("competitors", []))
-            self._ensure_not_stopped(task_id)
-            self._first_analysis(task_id, dataset, source_map)
-            last_failure_signature = ""
-            repeated_failure_count = 0
-            deep_refresh_needed = False
-            for qa_round in range(3):
-                self._ensure_not_stopped(task_id)
-                rejected_claim_id = self._qa_check(task_id, first_pass=(qa_round == 0), rework_round=qa_round)
-                self._ensure_not_stopped(task_id)
-                if not rejected_claim_id:
-                    break
-                failure_signature = self._primary_open_finding_signature(task_id, rejected_claim_id) or rejected_claim_id
-                if failure_signature == last_failure_signature:
-                    repeated_failure_count += 1
-                else:
-                    last_failure_signature = failure_signature
-                    repeated_failure_count = 1
-                if repeated_failure_count >= 3:
-                    self._handoff_open_findings_to_manual_review(task_id, repeated_failure_count, qa_round, failure_signature)
-                    break
-                self._auto_repair_open_findings(task_id, qa_round + 1)
-                self._ensure_not_stopped(task_id)
-                self._repair_analysis(task_id, rejected_claim_id, source_map)
-                deep_refresh_needed = self._analysis_artifact_needs_refresh(task_id)
-            if deep_refresh_needed:
-                self._ensure_not_stopped(task_id)
-                self._refresh_deep_analysis_from_current_claims(
+            if WorkflowStateGraph is None:
+                reason = sanitize_text(str(_WORKFLOW_LANGGRAPH_IMPORT_ERROR or "LangGraph unavailable"), 300)
+                self._log_agent_event(
                     task_id,
-                    "自动质检修复完成后统一刷新深度分析产物",
+                    "编排层",
+                    "workflow_engine_fallback",
+                    f"顶层 LangGraph StateGraph 不可用，已降级为顺序工作流：{reason}",
+                    severity="warning",
+                    meta={"workflow_engine": "sequential_fallback", "fallback_reason": reason},
                 )
-            self._ensure_not_stopped(task_id)
-            self._generate_report(task_id)
-            self._set_task_completed(task_id)
+                self._run_initial_workflow_sequential(task_id, fallback_reason=reason)
+            else:
+                self._run_initial_workflow_graph(task_id)
         except WorkflowStopped:
             self._log_agent_event(
                 task_id,
@@ -413,6 +406,379 @@ class Orchestrator:
                 "任务已停止，编排层不再推进后续 Agent。",
                 severity="warning",
             )
+
+    def _workflow_agent_for_node(self, workflow_node: str) -> str:
+        return {
+            "collect": "采集 Agent",
+            "analyze": "分析 Agent",
+            "repair": "分析 Agent",
+            "refresh": "分析 Agent",
+            "qa_review": "质检 Agent",
+            "manual_handoff": "质检 Agent",
+            "report": "报告 Agent",
+        }.get(workflow_node, "编排层")
+
+    def _workflow_trace_record(self, workflow_node: str, result: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        record = {
+            "name": "workflow_node_trace",
+            "workflow_engine": WORKFLOW_ENGINE,
+            "workflow_node": workflow_node,
+            "result": result,
+        }
+        if extra:
+            record.update(sanitize_payload(extra))
+        return record
+
+    def _log_workflow_node_event(
+        self,
+        task_id: str,
+        workflow_node: str,
+        status: str,
+        message: str,
+        severity: str = "info",
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "workflow_engine": WORKFLOW_ENGINE,
+            "workflow_node": workflow_node,
+            "workflow_node_status": status,
+        }
+        if meta:
+            payload.update(meta)
+        self._log_agent_event(
+            task_id,
+            self._workflow_agent_for_node(workflow_node),
+            f"workflow_node_{status}",
+            message,
+            severity=severity,
+            meta=payload,
+        )
+
+    def _run_initial_workflow_graph(self, task_id: str) -> None:
+        stage_started = now_dt()
+        graph = self._build_initial_workflow_graph()
+        final_state = graph.invoke(
+            {"task_id": task_id, "workflow_trace": []},
+            config={"recursion_limit": 24},
+        )
+        trace = list(final_state.get("workflow_trace", []))
+        self._log_agent_run(
+            task_id,
+            agent_name="编排层",
+            input_summary="运行顶层 LangGraph StateGraph，多 Agent 节点按 DAG 依次流转。",
+            output_summary="顶层 LangGraph 工作流完成：采集、分析、质检和报告节点均已执行或按条件跳转。",
+            status="completed",
+            duration_ms=self._elapsed_ms(stage_started),
+            model_provider=WORKFLOW_ENGINE,
+            tool_calls=trace or [self._workflow_trace_record("workflow", "completed")],
+            started_at=stage_started,
+        )
+
+    def _build_initial_workflow_graph(self):
+        if WorkflowStateGraph is None:
+            raise RuntimeError("LangGraph StateGraph is unavailable")
+        graph = WorkflowStateGraph(WorkflowGraphState)
+        graph.add_node("prepare", self._workflow_prepare_node)
+        graph.add_node("collect", self._workflow_collect_node)
+        graph.add_node("analyze", self._workflow_analyze_node)
+        graph.add_node("qa_review", self._workflow_qa_review_node)
+        graph.add_node("repair", self._workflow_repair_node)
+        graph.add_node("manual_handoff", self._workflow_manual_handoff_node)
+        graph.add_node("refresh", self._workflow_refresh_node)
+        graph.add_node("report", self._workflow_report_node)
+        graph.add_node("complete", self._workflow_complete_node)
+        graph.set_entry_point("prepare")
+        graph.add_edge("prepare", "collect")
+        graph.add_edge("collect", "analyze")
+        graph.add_edge("analyze", "qa_review")
+        graph.add_conditional_edges(
+            "qa_review",
+            lambda state: state.get("next_node", "report"),
+            {"repair": "repair", "manual_handoff": "manual_handoff", "refresh": "refresh", "report": "report"},
+        )
+        graph.add_edge("repair", "qa_review")
+        graph.add_conditional_edges(
+            "manual_handoff",
+            lambda state: state.get("next_node", "report"),
+            {"refresh": "refresh", "report": "report"},
+        )
+        graph.add_edge("refresh", "report")
+        graph.add_edge("report", "complete")
+        graph.add_edge("complete", WORKFLOW_END)
+        return graph.compile()
+
+    def _run_initial_workflow_sequential(self, task_id: str, fallback_reason: str = "") -> None:
+        self._ensure_not_stopped(task_id)
+        dataset = self.load_dataset()
+        task_config = self._task_config(task_id)
+        source_map: dict[str, str] = {}
+        self._log_agent_event(
+            task_id,
+            "编排层",
+            "workflow_started",
+            "已创建任务，准备进入采集、分析、质检和报告链路。",
+            severity="warning" if fallback_reason else "info",
+            meta={"workflow_engine": "sequential_fallback" if fallback_reason else "sequential", "fallback_reason": fallback_reason},
+        )
+        source_mode = task_config.get("source_mode", "")
+        if "实时采集" in source_mode:
+            source_map.update(self._existing_user_material_source_map(task_id))
+            source_map.update(self._collect_real_sources(task_id, task_config, dataset))
+            self._ensure_not_stopped(task_id)
+            source_map.update(self._collect_manual_scope_sources(task_id, task_config, source_map))
+        elif "上传资料" in source_mode:
+            source_map.update(self._collect_user_supplied_sources(task_id, task_config))
+        else:
+            source_map.update(self._collect_sources(task_id, dataset))
+        self._ensure_not_stopped(task_id)
+        self._collect_appark_metrics_for_task(task_id, task_config.get("competitors", []))
+        self._ensure_not_stopped(task_id)
+        self._first_analysis(task_id, dataset, source_map)
+        last_failure_signature = ""
+        repeated_failure_count = 0
+        deep_refresh_needed = False
+        for qa_round in range(3):
+            self._ensure_not_stopped(task_id)
+            rejected_claim_id = self._qa_check(task_id, first_pass=(qa_round == 0), rework_round=qa_round)
+            self._ensure_not_stopped(task_id)
+            if not rejected_claim_id:
+                break
+            failure_signature = self._primary_open_finding_signature(task_id, rejected_claim_id) or rejected_claim_id
+            if failure_signature == last_failure_signature:
+                repeated_failure_count += 1
+            else:
+                last_failure_signature = failure_signature
+                repeated_failure_count = 1
+            if repeated_failure_count >= 3:
+                self._handoff_open_findings_to_manual_review(task_id, repeated_failure_count, qa_round, failure_signature)
+                break
+            self._auto_repair_open_findings(task_id, qa_round + 1)
+            self._ensure_not_stopped(task_id)
+            self._repair_analysis(task_id, rejected_claim_id, source_map)
+            deep_refresh_needed = self._analysis_artifact_needs_refresh(task_id)
+        if deep_refresh_needed:
+            self._ensure_not_stopped(task_id)
+            self._refresh_deep_analysis_from_current_claims(
+                task_id,
+                "自动质检修复完成后统一刷新深度分析产物",
+            )
+        self._ensure_not_stopped(task_id)
+        self._generate_report(task_id)
+        self._set_task_completed(task_id)
+
+    def _workflow_prepare_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        task_id = str(state["task_id"])
+        self._ensure_not_stopped(task_id)
+        self._log_workflow_node_event(task_id, "prepare", "started", "顶层 LangGraph StateGraph 已启动，准备读取任务配置。")
+        dataset = self.load_dataset()
+        task_config = self._task_config(task_id)
+        self._log_agent_event(
+            task_id,
+            "编排层",
+            "workflow_started",
+            "已创建任务，顶层 LangGraph StateGraph 将按采集、分析、质检和报告节点推进。",
+            meta={"workflow_engine": WORKFLOW_ENGINE, "workflow_node": "prepare"},
+        )
+        self._log_workflow_node_event(task_id, "prepare", "finished", "任务配置读取完成，进入采集节点。")
+        return {
+            "dataset": dataset,
+            "task_config": task_config,
+            "source_map": {},
+            "qa_round": 0,
+            "rejected_claim_id": "",
+            "last_failure_signature": "",
+            "repeated_failure_count": 0,
+            "deep_refresh_needed": False,
+            "next_node": "collect",
+            "workflow_trace": [self._workflow_trace_record("prepare", "completed")],
+        }
+
+    def _workflow_collect_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        task_id = str(state["task_id"])
+        self._ensure_not_stopped(task_id)
+        self._log_workflow_node_event(task_id, "collect", "started", "进入采集 Agent 节点：登记公开来源、上传材料、RSS/AppArk 和证据分片。")
+        dataset = dict(state.get("dataset") or {})
+        task_config = dict(state.get("task_config") or {})
+        source_map: dict[str, str] = {}
+        source_mode = task_config.get("source_mode", "")
+        if "实时采集" in source_mode:
+            source_map.update(self._existing_user_material_source_map(task_id))
+            source_map.update(self._collect_real_sources(task_id, task_config, dataset))
+            self._ensure_not_stopped(task_id)
+            source_map.update(self._collect_manual_scope_sources(task_id, task_config, source_map))
+        elif "上传资料" in source_mode:
+            source_map.update(self._collect_user_supplied_sources(task_id, task_config))
+        else:
+            source_map.update(self._collect_sources(task_id, dataset))
+        self._ensure_not_stopped(task_id)
+        self._collect_appark_metrics_for_task(task_id, task_config.get("competitors", []))
+        self._log_workflow_node_event(task_id, "collect", "finished", "采集 Agent 节点完成，进入分析节点。", meta={"source_map_count": len(source_map)})
+        return {
+            "source_map": source_map,
+            "workflow_trace": [self._workflow_trace_record("collect", "completed", {"source_map_count": len(source_map)})],
+        }
+
+    def _workflow_analyze_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        task_id = str(state["task_id"])
+        self._ensure_not_stopped(task_id)
+        self._log_workflow_node_event(task_id, "analyze", "started", "进入分析 Agent 节点：生成 claims、评分依据和深度报告草稿。")
+        self._first_analysis(task_id, dict(state.get("dataset") or {}), dict(state.get("source_map") or {}))
+        self._log_workflow_node_event(task_id, "analyze", "finished", "分析 Agent 节点完成，进入质检节点。")
+        return {
+            "qa_round": 0,
+            "rejected_claim_id": "",
+            "next_node": "qa_review",
+            "workflow_trace": [self._workflow_trace_record("analyze", "completed")],
+        }
+
+    def _workflow_qa_review_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        task_id = str(state["task_id"])
+        qa_round = int(state.get("qa_round") or 0)
+        self._ensure_not_stopped(task_id)
+        self._log_workflow_node_event(task_id, "qa_review", "started", f"进入质检 Agent 节点：执行第 {qa_round + 1} 轮自动质检。", meta={"qa_round": qa_round})
+        rejected_claim_id = self._qa_check(task_id, first_pass=(qa_round == 0), rework_round=qa_round)
+        self._ensure_not_stopped(task_id)
+        if not rejected_claim_id:
+            next_node = "refresh" if state.get("deep_refresh_needed") else "report"
+            self._log_workflow_node_event(task_id, "qa_review", "finished", "质检通过，进入报告节点。" if next_node == "report" else "质检通过，先刷新深度分析产物。")
+            return {
+                "rejected_claim_id": "",
+                "next_node": next_node,
+                "workflow_trace": [self._workflow_trace_record("qa_review", "passed", {"qa_round": qa_round})],
+            }
+
+        failure_signature = self._primary_open_finding_signature(task_id, rejected_claim_id) or rejected_claim_id
+        last_failure_signature = str(state.get("last_failure_signature") or "")
+        if failure_signature == last_failure_signature:
+            repeated_failure_count = int(state.get("repeated_failure_count") or 0) + 1
+        else:
+            repeated_failure_count = 1
+        if repeated_failure_count >= 3:
+            self._log_workflow_node_event(
+                task_id,
+                "qa_review",
+                "finished",
+                "同类质检失败已达到三次，转入 manual_pending 交接节点。",
+                severity="warning",
+                meta={"claim_id": rejected_claim_id, "failure_signature": failure_signature, "repeated_failure_count": repeated_failure_count},
+            )
+            return {
+                "rejected_claim_id": rejected_claim_id,
+                "last_failure_signature": failure_signature,
+                "repeated_failure_count": repeated_failure_count,
+                "next_node": "manual_handoff",
+                "workflow_trace": [
+                    self._workflow_trace_record(
+                        "qa_review",
+                        "manual_handoff",
+                        {"qa_round": qa_round, "claim_id": rejected_claim_id, "repeated_failure_count": repeated_failure_count},
+                    )
+                ],
+            }
+        self._log_workflow_node_event(
+            task_id,
+            "qa_review",
+            "finished",
+            "质检发现可自动修复问题，进入 repair 节点。",
+            severity="warning",
+            meta={"claim_id": rejected_claim_id, "failure_signature": failure_signature, "repeated_failure_count": repeated_failure_count},
+        )
+        return {
+            "rejected_claim_id": rejected_claim_id,
+            "last_failure_signature": failure_signature,
+            "repeated_failure_count": repeated_failure_count,
+            "next_node": "repair",
+            "workflow_trace": [
+                self._workflow_trace_record(
+                    "qa_review",
+                    "repair",
+                    {"qa_round": qa_round, "claim_id": rejected_claim_id, "repeated_failure_count": repeated_failure_count},
+                )
+            ],
+        }
+
+    def _workflow_repair_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        task_id = str(state["task_id"])
+        qa_round = int(state.get("qa_round") or 0)
+        rejected_claim_id = str(state.get("rejected_claim_id") or "")
+        self._ensure_not_stopped(task_id)
+        self._log_workflow_node_event(task_id, "repair", "started", "进入自动修复节点：补充来源、降级待确认或修复分析结论。", meta={"claim_id": rejected_claim_id, "qa_round": qa_round})
+        self._auto_repair_open_findings(task_id, qa_round + 1)
+        self._ensure_not_stopped(task_id)
+        self._repair_analysis(task_id, rejected_claim_id, dict(state.get("source_map") or {}))
+        deep_refresh_needed = bool(state.get("deep_refresh_needed")) or self._analysis_artifact_needs_refresh(task_id)
+        self._log_workflow_node_event(task_id, "repair", "finished", "自动修复完成，回到质检节点。", meta={"deep_refresh_needed": deep_refresh_needed})
+        return {
+            "qa_round": qa_round + 1,
+            "deep_refresh_needed": deep_refresh_needed,
+            "next_node": "qa_review",
+            "workflow_trace": [
+                self._workflow_trace_record(
+                    "repair",
+                    "completed",
+                    {"next_qa_round": qa_round + 1, "deep_refresh_needed": deep_refresh_needed},
+                )
+            ],
+        }
+
+    def _workflow_manual_handoff_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        task_id = str(state["task_id"])
+        qa_round = int(state.get("qa_round") or 0)
+        repeated_failure_count = int(state.get("repeated_failure_count") or 0)
+        failure_signature = str(state.get("last_failure_signature") or state.get("rejected_claim_id") or "")
+        self._ensure_not_stopped(task_id)
+        self._log_workflow_node_event(task_id, "manual_handoff", "started", "进入 manual_pending 交接节点：同类失败转后续人工复核工作台。", severity="warning")
+        self._handoff_open_findings_to_manual_review(task_id, repeated_failure_count, qa_round, failure_signature)
+        next_node = "refresh" if state.get("deep_refresh_needed") else "report"
+        self._log_workflow_node_event(task_id, "manual_handoff", "finished", "manual_pending 交接完成，首版报告继续生成。", severity="warning", meta={"next_node": next_node})
+        return {
+            "next_node": next_node,
+            "workflow_trace": [
+                self._workflow_trace_record(
+                    "manual_handoff",
+                    "completed",
+                    {"repeated_failure_count": repeated_failure_count, "next_node": next_node},
+                )
+            ],
+        }
+
+    def _workflow_refresh_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        task_id = str(state["task_id"])
+        self._ensure_not_stopped(task_id)
+        self._log_workflow_node_event(task_id, "refresh", "started", "进入深度分析刷新节点：基于修复后的 claims 更新分析产物。")
+        if state.get("deep_refresh_needed"):
+            self._refresh_deep_analysis_from_current_claims(
+                task_id,
+                "自动质检修复完成后统一刷新深度分析产物",
+            )
+        self._log_workflow_node_event(task_id, "refresh", "finished", "深度分析刷新节点完成，进入报告节点。")
+        return {
+            "deep_refresh_needed": False,
+            "next_node": "report",
+            "workflow_trace": [self._workflow_trace_record("refresh", "completed")],
+        }
+
+    def _workflow_report_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        task_id = str(state["task_id"])
+        self._ensure_not_stopped(task_id)
+        self._log_workflow_node_event(task_id, "report", "started", "进入撰写/报告 Agent 节点：组织报告、Schema 校验、写入版本和生成 PDF。")
+        self._generate_report(task_id)
+        self._log_workflow_node_event(task_id, "report", "finished", "撰写/报告 Agent 节点完成，进入完成节点。")
+        return {
+            "next_node": "complete",
+            "workflow_trace": [self._workflow_trace_record("report", "completed")],
+        }
+
+    def _workflow_complete_node(self, state: WorkflowGraphState) -> WorkflowGraphState:
+        task_id = str(state["task_id"])
+        self._ensure_not_stopped(task_id)
+        self._log_workflow_node_event(task_id, "complete", "started", "进入完成节点：更新任务完成状态。")
+        self._set_task_completed(task_id)
+        self._log_workflow_node_event(task_id, "complete", "finished", "顶层 LangGraph StateGraph 工作流完成。")
+        return {
+            "next_node": "done",
+            "workflow_trace": [self._workflow_trace_record("complete", "completed")],
+        }
 
     def fail_workflow(self, task_id: str, exc: Exception) -> None:
         if self._is_task_stopped(task_id):
@@ -593,22 +959,33 @@ class Orchestrator:
             return {"status": "not_found", "result_summary": "该质检问题绑定的结论不存在。"}
 
         if action == "manual_supplement":
-            summary = self._manual_supplement_source(task_id, user_text or finding["reason"], claim["content"])
-            return {"status": "needs_review", "result_summary": summary, "finding_id": finding_id}
+            summary = self._manual_supplement_source(
+                task_id,
+                user_text or finding["reason"],
+                claim["content"],
+                claim_id=claim["id"],
+                finding_id=finding_id,
+            )
+            rejected_claim_id = self._qa_check(task_id, first_pass=False, rework_round=1)
+            self._generate_report(task_id, reason="manual_source")
+            self._set_task_completed(task_id)
+            return {
+                "status": "needs_review" if rejected_claim_id else "completed",
+                "result_summary": summary if rejected_claim_id else f"{summary} 复检通过，报告版本已更新。",
+                "finding_id": finding_id,
+                "claim_id": claim["id"],
+            }
         if action == "confirm_uncertainty":
-            summary = self._confirm_low_confidence_claim(task_id, user_text or "人工确认该不确定性结论。", claim["id"])
-            self._mark_finding_fixed(task_id, finding_id, "已由人工确认该结论，保留确认记录后生成新报告。")
-            return {"status": "completed", "result_summary": summary, "finding_id": finding_id}
+            summary = self._confirm_low_confidence_claim(task_id, user_text or "人工确认该不确定性结论。", claim["id"], finding_id=finding_id)
+            return {"status": "completed", "result_summary": summary, "finding_id": finding_id, "claim_id": claim["id"]}
+        if action == "dispute_claim":
+            summary = self._manual_dispute_claim(task_id, user_text or "人工质疑该结论，需要打回重做。", claim["content"], claim_id=claim["id"], finding_id=finding_id)
+            return {"status": "needs_review", "result_summary": summary, "finding_id": finding_id, "claim_id": claim["id"]}
         if not self._external_calls_allowed(task_id):
             summary = "未开启联网搜索，自动补采已跳过；请上传材料、手动补充来源，或开启联网搜索后再自动补采。"
             return {"status": "needs_review", "result_summary": summary, "finding_id": finding_id, "claim_id": claim["id"]}
 
         updated = self._auto_repair_claim_from_official_sources(task_id, finding, claim)
-        self._mark_finding_fixed(
-            task_id,
-            finding_id,
-            "已执行自动补采/重做分析；如仍有同类问题，复检会生成新的开放问题。",
-        )
         if self._analysis_artifact_needs_refresh(task_id):
             self._refresh_deep_analysis_from_current_claims(task_id, "质检问题修复后刷新深度分析产物")
         rejected_claim_id = self._qa_check(task_id, first_pass=False, rework_round=1)
@@ -621,10 +998,10 @@ class Orchestrator:
             "claim_id": claim["id"],
         }
 
-    def handle_manual_action(self, task_id: str, user_text: str, selected_text: str = "", claim_id: str = "") -> dict[str, Any]:
+    def handle_manual_action(self, task_id: str, user_text: str, selected_text: str = "", claim_id: str = "", action: str = "") -> dict[str, Any]:
         if self._task_workflow_busy(task_id):
             return self._busy_result(task_id)
-        intent, target_agent = self._interpret_manual_intent(user_text)
+        intent, target_agent = self._interpret_manual_intent(user_text, action)
         action_id = uuid.uuid4().hex
         created_at = utc_now_iso()
 
@@ -654,9 +1031,11 @@ class Orchestrator:
         elif intent == "recheck_qa":
             result_summary = self.recheck_qa(task_id, "人工复查要求重新质检")["result_summary"]
         elif intent == "supplement_source":
-            result_summary = self._manual_supplement_source(task_id, user_text, selected_text)
+            result_summary = self._manual_supplement_source(task_id, user_text, selected_text, claim_id=claim_id)
+        elif intent == "dispute_claim":
+            result_summary = self._manual_dispute_claim(task_id, user_text, selected_text, claim_id=claim_id)
         else:
-            result_summary = self._manual_revise_claim(task_id, user_text, selected_text)
+            result_summary = self._manual_revise_claim(task_id, user_text, selected_text, claim_id=claim_id)
 
         with self.connect() as conn:
             conn.execute(
@@ -1323,7 +1702,7 @@ class Orchestrator:
         events_by_node: dict[str, list[dict[str, Any]]] = {node_id: [] for node_id, _, _ in node_defs}
 
         for event in events:
-            node_id = agent_to_node.get(event["agent_name"], "collector" if event["agent_name"] == "编排层" else "")
+            node_id = agent_to_node.get(event["agent_name"], "")
             if not node_id:
                 continue
             events_by_node[node_id].append(
@@ -3055,6 +3434,9 @@ class Orchestrator:
             claims,
             Path(__file__).resolve().parent / "static",
         )
+        deep_report_execution_mode = getattr(react_report, "execution_mode", "") or (
+            "local_fallback" if react_report.provider == "local-react-fallback" else "unknown"
+        )
         analysis_markdown = self._guard_analysis_markdown(react_report.markdown, sources, claims)
         guarded_sections = self._guard_analysis_sections(react_report.sections, sources, claims)
         sections = self._ensure_analysis_sections(guarded_sections, analysis_markdown)
@@ -3069,6 +3451,7 @@ class Orchestrator:
         radar_data = self._build_radar_chart_data(score_dimensions)
         artifact = {
             "provider": react_report.provider,
+            "deep_report_execution_mode": deep_report_execution_mode,
             "analysis_markdown": analysis_markdown,
             "sections": sections,
             "score_dimensions": score_dimensions,
@@ -3084,8 +3467,13 @@ class Orchestrator:
             task_id,
             "分析 Agent",
             "deep_analysis_finished",
-            f"深度分析已保存：{len(sections)} 章、{len(score_dimensions)} 条评分项，模型状态 {react_report.provider}。",
-            meta={"provider": react_report.provider, "fallback_reason": react_report.fallback_reason, "artifact_saved": artifact_saved},
+            f"深度分析已保存：{len(sections)} 章、{len(score_dimensions)} 条评分项，模型状态 {react_report.provider}，执行模式 {deep_report_execution_mode}。",
+            meta={
+                "provider": react_report.provider,
+                "deep_report_execution_mode": deep_report_execution_mode,
+                "fallback_reason": react_report.fallback_reason,
+                "artifact_saved": artifact_saved,
+            },
         )
         return artifact
 
@@ -3978,6 +4366,36 @@ class Orchestrator:
                             {"repair_action": "confirm_uncertainty"},
                         )
                     )
+                if int(claim["needs_review"] or 0) and claim["status"] != "confirmed" and not claim["uncertainty"]:
+                    blocking_findings.append(
+                        self._qa_finding(
+                            claim,
+                            "medium",
+                            "待复核结论缺少不确定性、人工处理说明或后续补证口径。",
+                            "分析 Agent",
+                            "needs_review_missing_uncertainty",
+                            "补充不确定性说明、人工确认记录或补充来源后再复检。",
+                            {"repair_action": "manual_supplement"},
+                        )
+                    )
+                if source_ids and claim["status"] != "confirmed":
+                    manual_only_sources = [
+                        source_by_id[source_id]
+                        for source_id in source_ids
+                        if source_id in source_by_id and source_by_id[source_id]["source_type"] in {"manual_input"}
+                    ]
+                    if len(manual_only_sources) == len([source_id for source_id in source_ids if source_id in source_by_id]) and manual_only_sources:
+                        blocking_findings.append(
+                            self._qa_finding(
+                                claim,
+                                "medium",
+                                "该结论只绑定了人工口述材料，缺少可核验链接、上传材料或人工确认结论。",
+                                "质检 Agent",
+                                "manual_evidence_needs_validation",
+                                "补充可追溯来源，或由人工确认后提高置信度并记录确认来源。",
+                                {"repair_action": "manual_supplement"},
+                            )
+                        )
                 content_key = sanitize_text(claim["content"], 180)
                 if content_key in seen_contents:
                     blocking_findings.append(
@@ -4123,6 +4541,31 @@ class Orchestrator:
 
         if blocking_findings:
             rejected_claim_id = blocking_findings[0]["claim_id"]
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, meta_json FROM qa_findings WHERE task_id = ? AND fix_status = 'open'",
+                    (task_id,),
+                ).fetchall()
+                for row in rows:
+                    meta = loads(row["meta_json"], {})
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    manual_verdict = str(meta.get("manual_verdict") or "")
+                    if meta.get("manual_review_state") == "awaiting_recheck" or manual_verdict in {"supplemented_source", "revise_claim"}:
+                        meta["manual_review_state"] = "needs_more_input"
+                        conn.execute(
+                            """
+                            UPDATE qa_findings
+                            SET meta_json = ?, recheck_result = ?
+                            WHERE task_id = ? AND id = ?
+                            """,
+                            (
+                                dumps(sanitize_payload(meta)),
+                                "系统复检仍未通过：需要继续补充来源、修订结论或人工确认。",
+                                task_id,
+                                row["id"],
+                            ),
+                        )
             self._update_task(task_id, "qa_rework")
             self._log_agent_event(
                 task_id,
@@ -4159,14 +4602,32 @@ class Orchestrator:
 
         self._update_task(task_id, "qa_passed")
         with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE qa_findings
-                SET fix_status = 'fixed', recheck_result = '复检通过：修复后结论已绑定来源，并保留低置信度待确认标记。', fixed_at = ?
-                WHERE task_id = ? AND fix_status = 'open'
-                """,
-                (utc_now_iso(), task_id),
-            )
+            open_findings = conn.execute(
+                "SELECT id, meta_json FROM qa_findings WHERE task_id = ? AND fix_status = 'open'",
+                (task_id,),
+            ).fetchall()
+            fixed_at = utc_now_iso()
+            for finding in open_findings:
+                meta = loads(finding["meta_json"], {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                manual_verdict = str(meta.get("manual_verdict") or "")
+                if meta.get("manual_review_state") == "awaiting_recheck" or manual_verdict in {"supplemented_source", "revise_claim"}:
+                    meta["manual_review_state"] = "system_rechecked"
+                    recheck_result = "系统复检通过：人工补充/修订后的结论已通过自动 QA，并刷新报告版本。"
+                elif manual_verdict == "confirmed":
+                    meta["manual_review_state"] = "manual_confirmed"
+                    recheck_result = "人工确认已修复：该结论已由用户确认并关闭。"
+                else:
+                    recheck_result = "复检通过：修复后结论已绑定来源，并保留低置信度待确认标记。"
+                conn.execute(
+                    """
+                    UPDATE qa_findings
+                    SET fix_status = 'fixed', recheck_result = ?, fixed_at = ?, meta_json = ?
+                    WHERE task_id = ? AND id = ?
+                    """,
+                    (recheck_result, fixed_at, dumps(sanitize_payload(meta)), task_id, finding["id"]),
+                )
         self._log_agent_event(
             task_id,
             "质检 Agent",
@@ -4349,7 +4810,12 @@ class Orchestrator:
         metadata = dict(meta or {})
         metadata.setdefault("finding_type", finding_type)
         metadata.setdefault("section", section)
+        metadata.setdefault("affected_section", section)
         metadata.setdefault("source_ids", source_ids)
+        repair_action = sanitize_text(str(metadata.get("repair_action") or ""), 80) or self._default_repair_action_for_finding(finding_type, target_agent)
+        metadata["repair_action"] = repair_action
+        metadata["can_auto_repair"] = repair_action == "auto_collect"
+        metadata["needs_manual_review"] = repair_action in {"manual_supplement", "confirm_uncertainty", "dispute_claim"}
         if section == "pricing_model" and "missing_material" not in metadata:
             metadata["missing_material"] = "需要官方价格页、规格/型号/套餐页面或带采集日期的权威价格材料。"
         return {
@@ -4361,6 +4827,17 @@ class Orchestrator:
             "action_hint": sanitize_text(action_hint, 300),
             "meta": sanitize_payload(metadata, 900),
         }
+
+    def _default_repair_action_for_finding(self, finding_type: str, target_agent: str = "") -> str:
+        if finding_type in {"missing_source", "low_confidence_missing_uncertainty", "needs_review_missing_uncertainty", "manual_evidence_needs_validation"}:
+            return "manual_supplement"
+        if finding_type in {"source_ownership_mismatch", "scope_only", "missing_date", "pricing_missing_official"}:
+            return "auto_collect"
+        if finding_type == "manual_dispute":
+            return "dispute_claim"
+        if "采集" in str(target_agent or ""):
+            return "auto_collect"
+        return "manual_supplement"
 
     def _dedupe_qa_findings(self, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
         deduped: list[dict[str, Any]] = []
@@ -4521,11 +4998,19 @@ class Orchestrator:
             updated = self._auto_repair_claim_from_official_sources(task_id, finding, claim)
             if updated:
                 fixed += 1
-                self._mark_finding_fixed(
-                    task_id,
-                    finding["id"],
-                    f"第 {rework_round} 轮已自动补采来源并重做该条分析，等待质检复检。",
-                )
+                with self.connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE qa_findings
+                        SET recheck_result = ?
+                        WHERE task_id = ? AND id = ? AND fix_status = 'open'
+                        """,
+                        (
+                            f"第 {rework_round} 轮已自动补采来源并重做该条分析，等待质检复检决定是否关闭。",
+                            task_id,
+                            finding["id"],
+                        ),
+                    )
         self._log_agent_event(
             task_id,
             "分析 Agent",
@@ -4803,7 +5288,7 @@ class Orchestrator:
             return self._swot_summary(competitor, sources)
         return f"{competitor} 的产品/功能结论已改为仅使用同竞品来源：{refs}。"
 
-    def _manual_supplement_source(self, task_id: str, user_text: str, selected_text: str) -> str:
+    def _manual_supplement_source(self, task_id: str, user_text: str, selected_text: str, claim_id: str = "", finding_id: str = "") -> str:
         self._update_task(task_id, "collecting")
         source_id = f"{task_id[:8]}_manual_{uuid.uuid4().hex[:8]}"
         excerpt = selected_text or user_text
@@ -4831,9 +5316,69 @@ class Orchestrator:
                     utc_now_iso(),
                     "medium",
                     sanitize_text(excerpt, 500),
-                    "[]",
+                    dumps([claim_id] if claim_id else []),
                 ),
             )
+            self._insert_text_evidence(conn, task_id, source_id, sanitize_text(excerpt, 1200), utc_now_iso())
+            updated_claim = None
+            confidence_before = None
+            confidence_after = None
+            if claim_id:
+                claim = conn.execute(
+                    "SELECT * FROM claims WHERE task_id = ? AND id = ?",
+                    (task_id, claim_id),
+                ).fetchone()
+                if claim:
+                    source_ids = loads(claim["source_ids"], [])
+                    merged_source_ids = list(dict.fromkeys([*source_ids, source_id]))
+                    confidence_before = float(claim["confidence"] or 0)
+                    confidence_floor = 0.72 if manual_url else 0.66
+                    confidence_after = round(max(confidence_before, confidence_floor), 2)
+                    uncertainty = (
+                        f"已补充人工来源：{sanitize_text(user_text, 160)}；仍需质检复核来源是否足以支撑结论。"
+                    )
+                    conn.execute(
+                        """
+                        UPDATE claims
+                        SET source_ids = ?, confidence = ?, needs_review = 1,
+                            status = 'needs_review', uncertainty = ?
+                        WHERE task_id = ? AND id = ?
+                        """,
+                        (dumps(merged_source_ids), confidence_after, uncertainty, task_id, claim_id),
+                    )
+                    self._insert_evidence_links(conn, task_id, "claims", claim_id, [source_id], sanitize_text(excerpt, 260))
+                    updated_claim = claim
+            if finding_id:
+                finding = conn.execute(
+                    "SELECT meta_json FROM qa_findings WHERE task_id = ? AND id = ?",
+                    (task_id, finding_id),
+                ).fetchone()
+                meta = loads(finding["meta_json"], {}) if finding else {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta.update(
+                    {
+                        "manual_verdict": "supplemented_source",
+                        "manual_review_state": "awaiting_recheck",
+                        "manual_source_id": source_id,
+                        "affected_section": row_get(updated_claim, "section", meta.get("affected_section", "")) if updated_claim else meta.get("affected_section", ""),
+                        "confidence_before": confidence_before,
+                        "confidence_after": confidence_after,
+                    }
+                )
+                conn.execute(
+                    """
+                    UPDATE qa_findings
+                    SET meta_json = ?, recheck_result = ?
+                    WHERE task_id = ? AND id = ?
+                    """,
+                    (
+                        dumps(sanitize_payload(meta)),
+                        "已补充人工来源，等待重新质检决定是否关闭该问题。",
+                        task_id,
+                        finding_id,
+                    ),
+                )
         self._log_agent_run(
             task_id,
             agent_name="采集 Agent",
@@ -4843,41 +5388,201 @@ class Orchestrator:
             duration_ms=6800,
             tool_calls=[{"name": "register_manual_source", "result": source_id}],
         )
-        claim_id = uuid.uuid4().hex
-        self._insert_claims(
-            task_id,
-            [
-                {
-                    "id": claim_id,
-                    "section": "overview",
-                    "content": "人工复查已补充证据需求，系统保留该说明并将相关结论继续标记为待复核。",
-                    "confidence": 0.66,
-                    "source_ids": [source_id],
-                    "needs_review": True,
-                    "status": "needs_review",
-                    "uncertainty": "人工输入可作为线索，正式事实仍需外部来源核验。",
-                }
-            ],
-        )
+        if not claim_id:
+            new_claim_id = uuid.uuid4().hex
+            self._insert_claims(
+                task_id,
+                [
+                    {
+                        "id": new_claim_id,
+                        "section": "overview",
+                        "content": "人工复查已补充证据需求，系统保留该说明并将相关结论继续标记为待复核。",
+                        "confidence": 0.66,
+                        "source_ids": [source_id],
+                        "needs_review": True,
+                        "status": "needs_review",
+                        "uncertainty": "人工输入可作为线索，正式事实仍需外部来源核验。",
+                    }
+                ],
+            )
         self._log_agent_run(
             task_id,
             agent_name="分析 Agent",
             input_summary="读取人工补充来源并更新待复核说明。",
-            output_summary="已新增 1 条带人工来源的待复核概览结论。",
+            output_summary="已将人工来源绑定到目标结论。" if claim_id else "已新增 1 条带人工来源的待复核概览结论。",
             status="rerun_completed",
             duration_ms=9200,
             retry_count=1,
+            tool_calls=[{"name": "bind_manual_source_to_claim", "result": claim_id or "new_overview_claim", "source_id": source_id}],
         )
         self._refresh_deep_analysis_from_current_claims(task_id, "人工补充来源后刷新深度分析产物")
+        if claim_id:
+            return "已补充人工来源并绑定到目标结论，等待重新质检决定是否关闭该问题。"
         self._qa_check(task_id, first_pass=False)
         self._generate_report(task_id, reason="manual_source")
         self._set_task_completed(task_id)
         return "已补充人工来源，重新分析与质检通过，并生成新的报告版本。"
 
-    def _manual_revise_claim(self, task_id: str, user_text: str, selected_text: str) -> str:
+    def _manual_match_text(self, value: str) -> str:
+        text = sanitize_text(value or "", 2000).casefold()
+        text = re.sub(r"\[[^\]]+\]", "", text)
+        return re.sub(r"\s+", "", text)
+
+    def _manual_match_score(self, selected_text: str, candidate: str) -> float:
+        selected = self._manual_match_text(selected_text)
+        target = self._manual_match_text(candidate)
+        if not selected or not target:
+            return 0.0
+        if selected in target or target in selected:
+            return 1.0
+        short = selected[:260]
+        if short and short in target:
+            return 0.92
+        return SequenceMatcher(None, selected[:500], target[:900]).ratio()
+
+    def _find_manual_revision_claim(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        selected_text: str,
+        claim_id: str = "",
+    ) -> sqlite3.Row | None:
+        if claim_id:
+            claim = conn.execute(
+                "SELECT * FROM claims WHERE task_id = ? AND id = ?",
+                (task_id, claim_id),
+            ).fetchone()
+            if claim:
+                return claim
+        if not selected_text:
+            return None
+        rows = conn.execute(
+            "SELECT * FROM claims WHERE task_id = ? ORDER BY created_at DESC, rowid DESC",
+            (task_id,),
+        ).fetchall()
+        scored = [(self._manual_match_score(selected_text, row["content"]), row) for row in rows]
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored[0][1] if scored and scored[0][0] >= 0.45 else None
+
+    def _manual_revision_replacement_text(self, user_text: str, selected_text: str) -> str:
+        instruction = sanitize_text(user_text, 420)
+        original = sanitize_text(selected_text, 260)
+        return (
+            f"【人工修正待复核】该段已按人工反馈进入重分析：{instruction}"
+            + (f" 原选中表述：{original}" if original else "")
+            + " 系统已重新质检并生成新报告版本；正式定稿前需核对新增来源和待复核状态。"
+        )
+
+    def _patch_text_for_manual_revision(self, text: str, selected_text: str, replacement: str) -> tuple[str, bool]:
+        if not text:
+            return text, False
+        if selected_text and selected_text in text:
+            return text.replace(selected_text, replacement, 1), True
+        blocks = re.split(r"(\n{2,})", text)
+        best_index = -1
+        best_score = 0.0
+        for index, block in enumerate(blocks):
+            if not block.strip() or re.fullmatch(r"\n{2,}", block):
+                continue
+            score = self._manual_match_score(selected_text, block)
+            if score > best_score:
+                best_index = index
+                best_score = score
+        if best_index >= 0 and best_score >= 0.32:
+            blocks[best_index] = replacement
+            return "".join(blocks), True
+        suffix = "\n\n" if text.strip() else ""
+        return f"{text.rstrip()}{suffix}{replacement}", False
+
+    def _patch_latest_analysis_artifact_for_manual_revision(
+        self,
+        task_id: str,
+        selected_text: str,
+        user_text: str,
+        source_id: str,
+        claim_id: str = "",
+    ) -> bool:
+        artifact = self._latest_analysis_artifact(task_id)
+        if not artifact:
+            return False
+        replacement = self._manual_revision_replacement_text(user_text, selected_text)
+        sections = [dict(section) for section in artifact.get("sections") or [] if isinstance(section, dict)]
+        patched_sections: list[dict[str, Any]] = []
+        patched_section = False
+        for section in sections:
+            item = dict(section)
+            body = str(item.get("markdown") or item.get("body") or "")
+            patched_body, changed = self._patch_text_for_manual_revision(body, selected_text, replacement)
+            if changed and not patched_section:
+                patched_section = True
+                if item.get("markdown"):
+                    item["markdown"] = patched_body
+                item["body"] = patched_body
+                item.setdefault("manual_revision", True)
+                item["manual_revision_source_id"] = source_id
+            patched_sections.append(item)
+        markdown, patched_markdown = self._patch_text_for_manual_revision(
+            str(artifact.get("analysis_markdown") or ""),
+            selected_text,
+            replacement,
+        )
+        if not patched_section and patched_sections:
+            first = dict(patched_sections[0])
+            body = str(first.get("markdown") or first.get("body") or "")
+            body = f"{body.rstrip()}\n\n{replacement}" if body.strip() else replacement
+            if first.get("markdown"):
+                first["markdown"] = body
+            first["body"] = body
+            first.setdefault("manual_revision", True)
+            first["manual_revision_source_id"] = source_id
+            patched_sections[0] = first
+            patched_section = True
+        if not patched_sections and replacement:
+            patched_sections = [
+                {
+                    "key": "manual_revision",
+                    "title": "人工修正待复核",
+                    "body": replacement,
+                    "markdown": replacement,
+                    "manual_revision": True,
+                    "manual_revision_source_id": source_id,
+                }
+            ]
+            patched_section = True
+        if not patched_markdown:
+            markdown = f"{str(artifact.get('analysis_markdown') or '').rstrip()}\n\n{replacement}".strip()
+        tool_calls = list(artifact.get("tool_calls") or [])
+        tool_calls.append(
+            {
+                "name": "manual_revision_patch_selected_report_text",
+                "result": "patched" if patched_section else "appended",
+                "source_id": source_id,
+                "claim_id": claim_id,
+            }
+        )
+        return self._save_analysis_artifact(
+            task_id,
+            {
+                **artifact,
+                "analysis_markdown": markdown,
+                "sections": patched_sections,
+                "tool_calls": tool_calls,
+            },
+        )
+
+    def _manual_revise_claim(self, task_id: str, user_text: str, selected_text: str, claim_id: str = "") -> str:
         self._update_task(task_id, "reanalyzing")
         source_id = f"{task_id[:8]}_manual_revision_{uuid.uuid4().hex[:8]}"
+        selected_excerpt = sanitize_text(selected_text, 900)
+        revision_text = sanitize_text(user_text, 900)
+        target_claim_id = ""
+        target_section = "overview"
+        revision_finding_id = uuid.uuid4().hex
         with self.connect() as conn:
+            target_claim = self._find_manual_revision_claim(conn, task_id, selected_text, claim_id)
+            if target_claim:
+                target_claim_id = target_claim["id"]
+                target_section = target_claim["section"] or target_section
             conn.execute(
                 """
                 INSERT INTO sources
@@ -4895,61 +5600,407 @@ class Orchestrator:
                     "",
                     utc_now_iso(),
                     "medium",
-                    sanitize_text(selected_text or user_text, 500),
-                    "[]",
+                    sanitize_text(f"选中文本：{selected_excerpt}\n修正说明：{revision_text}", 900),
+                    dumps([target_claim_id] if target_claim_id else []),
                 ),
             )
-        self._insert_claims(
-            task_id,
-            [
-                {
-                    "section": "overview",
-                    "content": f"根据人工修正，报告应优先复核：{sanitize_text(user_text, 120)}",
-                    "confidence": 0.68,
-                    "source_ids": [source_id],
-                    "needs_review": True,
-                    "status": "needs_review",
-                    "uncertainty": "人工修正意见已入库，外部事实仍需来源支撑。",
-                }
-            ],
-        )
+            self._insert_text_evidence(conn, task_id, source_id, sanitize_text(f"{selected_excerpt}\n{revision_text}", 1200), utc_now_iso())
+            revised_claim_content = self._manual_revision_replacement_text(user_text, selected_text)
+            if target_claim:
+                existing_sources = loads(target_claim["source_ids"], [])
+                merged_sources = list(dict.fromkeys([*existing_sources, source_id]))
+                conn.execute(
+                    """
+                    UPDATE claims
+                    SET content = ?, confidence = ?, source_ids = ?, needs_review = 1,
+                        status = 'needs_review', uncertainty = ?, claim_type = 'inference'
+                    WHERE task_id = ? AND id = ?
+                    """,
+                    (
+                        sanitize_text(revised_claim_content, 1200),
+                        round(min(float(target_claim["confidence"] or 0.68), 0.62), 2),
+                        dumps(merged_sources),
+                        f"人工要求修正该结论：{sanitize_text(user_text, 220)}。需重新搜索、质检或补充来源后确认。",
+                        task_id,
+                        target_claim_id,
+                    ),
+                )
+                self._insert_evidence_links(conn, task_id, "claims", target_claim_id, [source_id], revised_claim_content[:260])
+            else:
+                target_claim_id = uuid.uuid4().hex
+                self._insert_claims(
+                    task_id,
+                    [
+                        {
+                            "id": target_claim_id,
+                            "section": target_section,
+                            "content": revised_claim_content,
+                            "confidence": 0.62,
+                            "source_ids": [source_id],
+                            "needs_review": True,
+                            "status": "needs_review",
+                            "claim_type": "inference",
+                            "uncertainty": "人工修正意见已入库，外部事实仍需来源支撑。",
+                        }
+                    ],
+                    conn=conn,
+                )
+            conn.execute(
+                """
+                INSERT INTO qa_findings
+                (id, task_id, claim_id, severity, reason, target_agent, finding_type, action_hint, meta_json,
+                 fix_status, recheck_result, created_at, fixed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    revision_finding_id,
+                    task_id,
+                    target_claim_id,
+                    "medium",
+                    f"人工要求修正选中报告段落：{sanitize_text(user_text, 240)}",
+                    "分析 Agent",
+                    "manual_revision",
+                    "重新搜索/补证后复核该段表述，必要时再次修订报告。",
+                    dumps(
+                        sanitize_payload(
+                            {
+                                "manual_verdict": "revise_claim",
+                                "manual_review_state": "awaiting_recheck",
+                                "manual_source_id": source_id,
+                                "affected_section": target_section,
+                                "selected_text": sanitize_text(selected_text, 500),
+                                "repair_action": "manual_supplement",
+                                "can_auto_repair": True,
+                                "needs_manual_review": True,
+                            }
+                        )
+                    ),
+                    "open",
+                    "人工修正已记录，等待质检复核和来源补强。",
+                    utc_now_iso(),
+                    "",
+                ),
+            )
+        if self._external_calls_allowed(task_id):
+            with self.connect() as conn:
+                revision_finding = conn.execute(
+                    "SELECT * FROM qa_findings WHERE task_id = ? AND id = ?",
+                    (task_id, revision_finding_id),
+                ).fetchone()
+                revision_claim = conn.execute(
+                    "SELECT * FROM claims WHERE task_id = ? AND id = ?",
+                    (task_id, target_claim_id),
+                ).fetchone()
+            if revision_finding and revision_claim:
+                self._log_agent_event(
+                    task_id,
+                    "采集 Agent",
+                    "manual_revision_search_started",
+                    "人工修正后正在尝试按目标结论补搜公开来源。",
+                    meta={"claim_id": target_claim_id, "finding_id": revision_finding_id},
+                )
+                self._auto_repair_claim_from_official_sources(task_id, revision_finding, revision_claim)
+        else:
+            self._log_agent_event(
+                task_id,
+                "采集 Agent",
+                "manual_revision_search_skipped",
+                "当前任务未开启实时采集，人工修正不会联网补搜；可使用“要求重新搜索”或开启实时采集后重跑。",
+                severity="warning",
+                meta={"claim_id": target_claim_id, "finding_id": revision_finding_id},
+            )
         self._log_agent_run(
             task_id,
             agent_name="分析 Agent",
             input_summary="人工复查要求修正结论。",
-            output_summary="已新增人工修正结论并绑定 manual_input 来源。",
+            output_summary="已定位选中段落/目标结论，写入人工修正来源并标记为待复核。",
             status="rerun_completed",
             duration_ms=8600,
             retry_count=1,
+            has_rework=True,
+            tool_calls=[{"name": "manual_revision_update_claim", "claim_id": target_claim_id, "source_id": source_id}],
         )
         self._refresh_deep_analysis_from_current_claims(task_id, "人工修正结论后刷新深度分析产物")
+        patched = self._patch_latest_analysis_artifact_for_manual_revision(task_id, selected_text, user_text, source_id, target_claim_id)
+        self._log_agent_event(
+            task_id,
+            "分析 Agent",
+            "manual_revision_selected_text_patched",
+            "已将人工修正写回深度报告目标段落。" if patched else "未找到深度报告产物，人工修正已保留在结构化结论中。",
+            meta={"claim_id": target_claim_id, "source_id": source_id, "patched": patched},
+        )
         self._qa_check(task_id, first_pass=False)
         self._generate_report(task_id, reason="manual_revision")
         self._set_task_completed(task_id)
-        return "已根据人工修正更新结论，重新质检通过，并生成新的报告版本。"
+        return "已根据选中文本修正目标结论，重新分析、质检并生成新的报告版本。"
 
-    def _confirm_low_confidence_claim(self, task_id: str, user_text: str, claim_id: str = "") -> str:
+    def _manual_dispute_claim(self, task_id: str, user_text: str, selected_text: str, claim_id: str = "", finding_id: str = "") -> str:
+        self._update_task(task_id, "reanalyzing")
+        source_id = f"{task_id[:8]}_manual_dispute_{uuid.uuid4().hex[:8]}"
+        excerpt = sanitize_text(selected_text or user_text, 900)
+        target_claim: sqlite3.Row | None = None
+        confidence_before = 0.0
+        confidence_after = 0.45
+        source_ids: list[str] = []
+        with self.connect() as conn:
+            if claim_id:
+                target_claim = conn.execute(
+                    "SELECT * FROM claims WHERE task_id = ? AND id = ?",
+                    (task_id, claim_id),
+                ).fetchone()
+            if not target_claim and selected_text:
+                target_claim = conn.execute(
+                    """
+                    SELECT * FROM claims
+                    WHERE task_id = ? AND content LIKE ?
+                    ORDER BY created_at DESC, rowid DESC LIMIT 1
+                    """,
+                    (task_id, f"%{sanitize_text(selected_text, 120)}%"),
+                ).fetchone()
+                claim_id = target_claim["id"] if target_claim else ""
+            conn.execute(
+                """
+                INSERT INTO sources
+                (id, task_id, source_type, title, url_or_path, author_site, published_at, collected_at,
+                 credibility, excerpt, related_claim_ids)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    task_id,
+                    "manual_input",
+                    "人工质疑/打回意见",
+                    "manual://dispute",
+                    "用户人工输入",
+                    "",
+                    utc_now_iso(),
+                    "medium",
+                    excerpt,
+                    dumps([claim_id] if claim_id else []),
+                ),
+            )
+            self._insert_text_evidence(conn, task_id, source_id, excerpt, utc_now_iso())
+            if target_claim:
+                existing_sources = loads(target_claim["source_ids"], [])
+                source_ids = list(dict.fromkeys([*existing_sources, source_id]))
+                confidence_before = float(target_claim["confidence"] or 0)
+                confidence_after = round(min(confidence_before, 0.45), 2)
+                conn.execute(
+                    """
+                    UPDATE claims
+                    SET source_ids = ?, confidence = ?, needs_review = 1,
+                        status = 'needs_review', uncertainty = ?
+                    WHERE task_id = ? AND id = ?
+                    """,
+                    (
+                        dumps(source_ids),
+                        confidence_after,
+                        f"人工质疑：{sanitize_text(user_text, 180)}。该结论需重新补证、降级或重写。",
+                        task_id,
+                        claim_id,
+                    ),
+                )
+                self._insert_evidence_links(conn, task_id, "claims", claim_id, [source_id], excerpt[:260])
+            if finding_id:
+                finding = conn.execute(
+                    "SELECT meta_json FROM qa_findings WHERE task_id = ? AND id = ?",
+                    (task_id, finding_id),
+                ).fetchone()
+                meta = loads(finding["meta_json"], {}) if finding else {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta.update(
+                    {
+                        "manual_verdict": "disputed",
+                        "manual_review_state": "needs_more_input",
+                        "manual_source_id": source_id,
+                        "affected_section": row_get(target_claim, "section", meta.get("affected_section", "")) if target_claim else meta.get("affected_section", ""),
+                        "confidence_before": confidence_before,
+                        "confidence_after": confidence_after,
+                        "repair_action": "dispute_claim",
+                        "can_auto_repair": False,
+                        "needs_manual_review": True,
+                    }
+                )
+                conn.execute(
+                    """
+                    UPDATE qa_findings
+                    SET meta_json = ?, recheck_result = ?
+                    WHERE task_id = ? AND id = ?
+                    """,
+                    (
+                        dumps(sanitize_payload(meta)),
+                        "人工已质疑该结论，系统已降级置信度并生成新的人工质疑问题。",
+                        task_id,
+                        finding_id,
+                    ),
+                )
+
+        if not target_claim:
+            return self._manual_revise_claim(task_id, user_text, selected_text)
+
+        self._log_agent_run(
+            task_id,
+            agent_name="分析 Agent",
+            input_summary="人工复核质疑原结论，要求打回或降级。",
+            output_summary="已将目标结论标记为 needs_review，降低置信度，并绑定人工质疑来源。",
+            status="rerun_completed",
+            duration_ms=8400,
+            retry_count=1,
+            has_rework=True,
+            tool_calls=[{"name": "manual_dispute_claim", "claim_id": claim_id, "source_id": source_id}],
+        )
+        self._refresh_deep_analysis_from_current_claims(task_id, "人工质疑后刷新深度分析产物")
+        self._qa_check(task_id, first_pass=False)
+        dispute_finding_id = uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO qa_findings
+                (id, task_id, claim_id, severity, reason, target_agent, finding_type, action_hint, meta_json,
+                 fix_status, recheck_result, created_at, fixed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    dispute_finding_id,
+                    task_id,
+                    claim_id,
+                    "high",
+                    f"人工质疑该结论：{sanitize_text(user_text, 240)}",
+                    "分析 Agent",
+                    "manual_dispute",
+                    "按人工质疑重做该模块，补充来源、降级结论或改写报告表述。",
+                    dumps(
+                        sanitize_payload(
+                            {
+                                "manual_verdict": "disputed",
+                                "manual_review_state": "needs_more_input",
+                                "manual_source_id": source_id,
+                                "affected_section": row_get(target_claim, "section", ""),
+                                "confidence_before": confidence_before,
+                                "confidence_after": confidence_after,
+                                "source_ids": source_ids,
+                                "repair_action": "manual_supplement",
+                                "can_auto_repair": False,
+                                "needs_manual_review": True,
+                            }
+                        )
+                    ),
+                    "open",
+                    "人工质疑已记录，等待分析刷新、补证或人工确认后复检。",
+                    utc_now_iso(),
+                    "",
+                ),
+            )
+        self._generate_report(task_id, reason="manual_dispute")
+        self._set_task_completed(task_id)
+        return "已记录人工质疑：目标结论已降级为待复核，生成 manual_dispute 问题，并刷新报告版本。"
+
+    def _confirm_low_confidence_claim(self, task_id: str, user_text: str, claim_id: str = "", finding_id: str = "") -> str:
         self._update_task(task_id, "qa_passed")
+        source_id = f"{task_id[:8]}_manual_confirm_{uuid.uuid4().hex[:8]}"
+        confirmation_text = sanitize_text(user_text or "人工确认该结论无误。", 900)
+        confirmed_claim_id = claim_id
+        confidence_before = None
+        confidence_after = None
         with self.connect() as conn:
             if claim_id:
                 row = conn.execute(
-                    "SELECT id FROM claims WHERE task_id = ? AND id = ?",
+                    "SELECT * FROM claims WHERE task_id = ? AND id = ?",
                     (task_id, claim_id),
                 ).fetchone()
             else:
                 row = conn.execute(
                     """
-                    SELECT id FROM claims
+                    SELECT * FROM claims
                     WHERE task_id = ? AND needs_review = 1
                     ORDER BY created_at DESC, rowid DESC LIMIT 1
                     """,
                     (task_id,),
                 ).fetchone()
             if row:
+                confirmed_claim_id = row["id"]
+                source_ids = loads(row["source_ids"], [])
+                merged_source_ids = list(dict.fromkeys([*source_ids, source_id]))
+                confidence_before = float(row["confidence"] or 0)
+                confidence_after = round(max(confidence_before, 0.85), 2)
                 conn.execute(
-                    "UPDATE claims SET needs_review = 0, status = 'confirmed', uncertainty = ? WHERE id = ?",
-                    (f"已由人工确认：{sanitize_text(user_text, 120)}", row["id"]),
+                    """
+                    INSERT INTO sources
+                    (id, task_id, source_type, title, url_or_path, author_site, published_at, collected_at,
+                     credibility, excerpt, related_claim_ids)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        source_id,
+                        task_id,
+                        "manual_confirmation",
+                        "人工确认记录",
+                        "manual://confirmation",
+                        "用户人工确认",
+                        "",
+                        utc_now_iso(),
+                        "high",
+                        confirmation_text,
+                        dumps([confirmed_claim_id]),
+                    ),
                 )
+                self._insert_text_evidence(conn, task_id, source_id, confirmation_text, utc_now_iso())
+                conn.execute(
+                    """
+                    UPDATE claims
+                    SET source_ids = ?, confidence = ?, needs_review = 0,
+                        status = 'confirmed', uncertainty = ?
+                    WHERE task_id = ? AND id = ?
+                    """,
+                    (
+                        dumps(merged_source_ids),
+                        confidence_after,
+                        f"已由人工确认：{sanitize_text(user_text, 160)}",
+                        task_id,
+                        confirmed_claim_id,
+                    ),
+                )
+                self._insert_evidence_links(conn, task_id, "claims", confirmed_claim_id, [source_id], confirmation_text[:260])
+                finding_rows = []
+                if finding_id:
+                    finding_rows = conn.execute(
+                        "SELECT id, meta_json FROM qa_findings WHERE task_id = ? AND id = ?",
+                        (task_id, finding_id),
+                    ).fetchall()
+                else:
+                    finding_rows = conn.execute(
+                        "SELECT id, meta_json FROM qa_findings WHERE task_id = ? AND claim_id = ? AND fix_status IN ('open', 'manual_pending')",
+                        (task_id, confirmed_claim_id),
+                    ).fetchall()
+                for finding in finding_rows:
+                    meta = loads(finding["meta_json"], {})
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    meta.update(
+                        {
+                            "manual_verdict": "confirmed",
+                            "manual_review_state": "manual_confirmed",
+                            "manual_source_id": source_id,
+                            "affected_section": row["section"],
+                            "confidence_before": confidence_before,
+                            "confidence_after": confidence_after,
+                        }
+                    )
+                    conn.execute(
+                        """
+                        UPDATE qa_findings
+                        SET fix_status = 'fixed', recheck_result = ?, fixed_at = ?, meta_json = ?
+                        WHERE task_id = ? AND id = ?
+                        """,
+                        (
+                            "人工确认无误：已创建 manual_confirmation 来源，提升置信度并关闭该问题。",
+                            utc_now_iso(),
+                            dumps(sanitize_payload(meta)),
+                            task_id,
+                            finding["id"],
+                        ),
+                    )
         self._log_agent_run(
             task_id,
             agent_name="质检 Agent",
@@ -4958,6 +6009,7 @@ class Orchestrator:
             status="completed",
             duration_ms=6200,
             retry_count=1,
+            tool_calls=[{"name": "manual_confirmation", "claim_id": confirmed_claim_id, "source_id": source_id, "confidence_after": confidence_after}],
         )
         self._generate_report(task_id, reason="manual_confirmation")
         self._set_task_completed(task_id)
@@ -5004,6 +6056,22 @@ class Orchestrator:
             ).fetchall()
             pricing_fact_rows = conn.execute(
                 "SELECT * FROM pricing_facts WHERE task_id = ? ORDER BY competitor_name, plan_name, price_type",
+                (task_id,),
+            ).fetchall()
+            feature_rows = conn.execute(
+                "SELECT * FROM feature_items WHERE task_id = ? ORDER BY competitor_name, level1, level2, rowid",
+                (task_id,),
+            ).fetchall()
+            pricing_rows = conn.execute(
+                "SELECT * FROM pricing_items WHERE task_id = ? ORDER BY competitor_name, plan_name, rowid",
+                (task_id,),
+            ).fetchall()
+            persona_rows = conn.execute(
+                "SELECT * FROM persona_items WHERE task_id = ? ORDER BY competitor_name, user_type, rowid",
+                (task_id,),
+            ).fetchall()
+            swot_rows = conn.execute(
+                "SELECT * FROM swot_items WHERE task_id = ? ORDER BY competitor_name, dimension, rowid",
                 (task_id,),
             ).fetchall()
             structured_counts = {
@@ -5066,7 +6134,12 @@ class Orchestrator:
         analysis_provider = analysis_artifact.get("provider", "")
         analysis_fallback = analysis_artifact.get("fallback_reason", "")
         analysis_markdown = analysis_artifact.get("analysis_markdown", "")
+        deep_report_execution_mode = analysis_artifact.get("deep_report_execution_mode", "")
         final_provider_label = self._provider_user_label(analysis_provider) if analysis_provider else provider_label
+        feature_tree_payload = [dict(row) for row in feature_rows] or report_enrichment.get("feature_scores", [])
+        pricing_model_payload = [dict(row) for row in pricing_rows] or report_enrichment.get("pricing_comparison", [])
+        user_persona_payload = [dict(row) for row in persona_rows] or report_enrichment.get("scenario_recommendations", [])
+        swot_payload: dict[str, Any] | list[dict[str, Any]] = [dict(row) for row in swot_rows] or competitor_swot
         content = {
             "title": f"{task['industry']}竞品分析报告",
             "summary": executive_summary,
@@ -5087,15 +6160,17 @@ class Orchestrator:
                 "search_result_count": len([source for source in sources if source["source_type"] in {"search_result", "volc_search_result"}]),
                 "model_provider": final_provider_label,
                 "provider_used": final_provider_label,
-                "llm_called": any(row["model_provider"] in {"doubao", "deepseek-react", "doubao-react"} for row in run_rows)
+                "llm_called": any(row["model_provider"] in {"doubao", "deepseek-react", "zhipu-react", "doubao-react"} for row in run_rows)
                 or report_trace.get("provider") == "doubao",
                 "search_called": self._search_called(run_rows),
                 "fallback_count": fallback_count + (1 if report_trace.get("fallback_reason") else 0),
                 "pricing_fact_count": len(pricing_fact_rows),
+                "workflow_engine": WORKFLOW_ENGINE,
                 "react_report_enabled": bool(analysis_markdown and not analysis_fallback),
                     "react_report_provider": analysis_provider,
                     "analysis_provider": analysis_provider,
                     "analysis_fallback_reason": analysis_fallback,
+                    "deep_report_execution_mode": deep_report_execution_mode,
                 },
             "sections": structured_sections,
             "display_sections": react_sections,
@@ -5103,11 +6178,16 @@ class Orchestrator:
             "react_report": {
                 "enabled": bool(analysis_markdown and not analysis_fallback),
                 "provider": analysis_provider,
+                "deep_report_execution_mode": deep_report_execution_mode,
                 "markdown": analysis_markdown,
                 "sections": react_sections,
                 "screenshots": analysis_artifact.get("screenshots", []),
                 "fallback_reason": analysis_fallback,
             },
+            "feature_tree": feature_tree_payload,
+            "pricing_model": pricing_model_payload,
+            "user_persona": user_persona_payload,
+            "swot": swot_payload,
             "competitor_swot": competitor_swot,
             "citation_refs": citation_map,
             "technical_section_count": len(raw_sections),
@@ -5115,6 +6195,32 @@ class Orchestrator:
             "reason": reason,
             **report_enrichment,
         }
+        try:
+            CompetitiveKnowledgeSchema.model_validate(content)
+        except Exception as exc:
+            safe_error = sanitize_text(str(exc), 600)
+            self._log_agent_event(
+                task_id,
+                "报告 Agent",
+                "report_schema_validation_failed",
+                f"CompetitiveKnowledgeSchema 校验失败：{safe_error}",
+                severity="error",
+                meta={"reason": reason},
+            )
+            self._log_agent_run(
+                task_id,
+                agent_name="报告 Agent",
+                input_summary="写入报告前校验 CompetitiveKnowledgeSchema。",
+                output_summary="报告结构未通过正式 Schema 校验，已阻止写入 reports。",
+                status="failed",
+                duration_ms=self._elapsed_ms(stage_started),
+                error=safe_error,
+                severity="error",
+                fallback_reason=safe_error,
+                tool_calls=[{"name": "validate_competitive_knowledge_schema", "result": "failed"}],
+                started_at=stage_started,
+            )
+            raise
 
         report_id = uuid.uuid4().hex
         report_version = int(report_count) + 1
@@ -7843,14 +8949,29 @@ class Orchestrator:
                 ),
             )
 
-    def _interpret_manual_intent(self, user_text: str) -> tuple[str, str]:
+    def _interpret_manual_intent(self, user_text: str, action: str = "") -> tuple[str, str]:
+        explicit = sanitize_text(str(action or ""), 80)
+        action_map = {
+            "confirm_claim": ("confirm_claim", "人工确认"),
+            "recheck_qa": ("recheck_qa", "质检 Agent"),
+            "supplement_source": ("supplement_source", "采集 Agent"),
+            "manual_supplement": ("supplement_source", "采集 Agent"),
+            "dispute_claim": ("dispute_claim", "分析 Agent"),
+            "revise_claim": ("revise_claim", "分析 Agent"),
+        }
+        if explicit in action_map:
+            return action_map[explicit]
         text = user_text.lower()
         if any(keyword in text for keyword in ["确认", "认可", "人工确认"]):
             return "confirm_claim", "人工确认"
+        if any(keyword in text for keyword in ["质疑", "不对", "错误", "错了", "重写", "降级", "打回", "不准确", "有问题"]):
+            return "dispute_claim", "分析 Agent"
         if any(keyword in text for keyword in ["来源", "证据", "搜索", "补充", "查找"]):
             return "supplement_source", "采集 Agent"
         if any(keyword in text for keyword in ["质检", "复检", "重新检查"]):
             return "recheck_qa", "质检 Agent"
+        if any(keyword in text for keyword in ["修正", "修改", "调整", "改成", "更正"]):
+            return "revise_claim", "分析 Agent"
         return "revise_claim", "分析 Agent"
 
     def _node_status_from_run(self, run_status: str) -> str:

@@ -23,6 +23,7 @@ from collector import VolcWebSearchClient, WebSourceDraft, chunk_text
 from feishu_publisher import FeishuPublishError, FeishuQuestionnairePublisher, build_feishu_questions
 from llm_provider import LLMProvider
 from orchestrator import Orchestrator, sanitize_markdown_text, sanitize_payload
+import react_report_agent
 from react_report_agent import (
     _coerce_zhipu_report_structure,
     _configured_providers,
@@ -31,7 +32,7 @@ from react_report_agent import (
     _sanitize_zhipu_claims,
     _sanitize_zhipu_sources,
 )
-from schema import ReportableClaim, utc_now_iso
+from schema import CompetitiveKnowledgeSchema, QAFindingRecord, ReportableClaim, utc_now_iso
 
 
 @pytest.fixture()
@@ -157,7 +158,7 @@ def test_index_copy_and_manual_modal_are_current(client):
     response = client.get("/")
     html = response.get_data(as_text=True)
     assert response.status_code == 200
-    assert "新一版" in html
+    assert "MOSS多agent智能竞品分析系统——小莫" in html
     assert "人工复查/补充材料" in html
     assert 'id="manualGuide"' in html
     assert 'id="manualTextLabel"' in html
@@ -429,6 +430,70 @@ def test_create_task_runs_full_agent_flow(client):
     assert report["content"]["metrics"]["citation_coverage"] == 1.0
     assert report["content"]["metrics"]["qa_rework_visible"] is False
     assert report["content"]["metrics"]["evidence_chunk_count"] > 0
+    CompetitiveKnowledgeSchema.model_validate(report["content"])
+    assert {
+        "feature_tree",
+        "pricing_model",
+        "user_persona",
+        "swot",
+        "source_catalog",
+        "methodology",
+        "chart_data",
+    } <= set(report["content"])
+
+
+def test_schema_accepts_manual_pending_and_rejects_incomplete_knowledge_payload():
+    finding = QAFindingRecord(
+        id="finding-1",
+        task_id="task-1",
+        claim_id="claim-1",
+        severity="high",
+        reason="同一问题自动修复三次仍未通过。",
+        target_agent="分析 Agent",
+        fix_status="manual_pending",
+        created_at=utc_now_iso(),
+    )
+    assert finding.fix_status == "manual_pending"
+
+    with pytest.raises(ValidationError):
+        CompetitiveKnowledgeSchema.model_validate(
+            {
+                "title": "缺少关键字段的报告",
+                "feature_tree": [],
+                "pricing_model": [],
+                "user_persona": [],
+                "swot": {},
+                "source_catalog": [],
+                "methodology": {},
+            }
+        )
+
+
+def test_report_schema_validation_blocks_report_insert(tmp_path, monkeypatch):
+    db_path = tmp_path / "report-schema.db"
+    app = create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
+    test_client = app.test_client()
+    task = create_demo_task(test_client)
+    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+
+    with sqlite3.connect(db_path) as conn:
+        before = conn.execute("SELECT COUNT(*) FROM reports WHERE task_id = ?", (task["id"],)).fetchone()[0]
+
+    def fail_validation(payload):
+        raise ValueError("forced schema failure")
+
+    monkeypatch.setattr("orchestrator.CompetitiveKnowledgeSchema.model_validate", fail_validation)
+    with pytest.raises(ValueError):
+        orch._generate_report(task["id"], reason="schema_validation_test")
+
+    with sqlite3.connect(db_path) as conn:
+        after = conn.execute("SELECT COUNT(*) FROM reports WHERE task_id = ?", (task["id"],)).fetchone()[0]
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM agent_events WHERE task_id = ? AND event_type = 'report_schema_validation_failed'",
+            (task["id"],),
+        ).fetchone()[0]
+    assert after == before
+    assert event_count == 1
 
 
 def test_create_task_accepts_mixed_source_mode(client):
@@ -544,7 +609,7 @@ def test_realtime_collection_without_volc_key_falls_back_to_bing_or_direct(clien
 
 
 def test_volc_search_client_builds_payload_and_parses_results(monkeypatch):
-    monkeypatch.setenv("VOLC_SEARCH_API_KEY", "volc-test-secret")
+    monkeypatch.setenv("VOLC_SEARCH_API_KEY", "test-key")
     monkeypatch.setenv("VOLC_SEARCH_COUNT", "2")
     captured = {}
 
@@ -586,7 +651,7 @@ def test_volc_search_client_builds_payload_and_parses_results(monkeypatch):
     results = VolcWebSearchClient().search("doubao pricing", "taskxxxx", limit=2)
 
     assert captured["url"].endswith("/search_api/web_search")
-    assert captured["headers"]["Authorization"] == "Bearer volc-test-secret"
+    assert captured["headers"]["Authorization"] == "Bearer test-key"
     assert captured["payload"]["SearchType"] == "web_summary"
     assert captured["payload"]["NeedSummary"] is True
     assert captured["payload"]["Filter"]["NeedContent"] is True
@@ -600,7 +665,7 @@ def test_volc_search_client_builds_payload_and_parses_results(monkeypatch):
 
 
 def test_volc_search_client_accepts_list_numeric_fields(monkeypatch):
-    monkeypatch.setenv("VOLC_SEARCH_API_KEY", "volc-test-secret")
+    monkeypatch.setenv("VOLC_SEARCH_API_KEY", "test-key")
     captured = {}
 
     class FakeResponse:
@@ -660,7 +725,7 @@ def test_volc_search_client_reloads_local_env_without_restart(tmp_path, monkeypa
     client = VolcWebSearchClient(env_path=env_path)
     assert client.config_status()["api_key_configured"] is False
 
-    env_path.write_text("VOLC_SEARCH_API_KEY=volc-test-secret\nVOLC_SEARCH_COUNT=1\n", encoding="utf-8")
+    env_path.write_text("VOLC_SEARCH_API_KEY=test-key\nVOLC_SEARCH_COUNT=1\n", encoding="utf-8")
 
     class FakeResponse:
         def __enter__(self):
@@ -680,7 +745,7 @@ def test_volc_search_client_reloads_local_env_without_restart(tmp_path, monkeypa
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     assert client.search("query", "task") == []
-    assert captured["authorization"] == "Bearer volc-test-secret"
+    assert captured["authorization"] == "Bearer test-key"
 
 
 def test_realtime_search_fallback_writes_search_sources(tmp_path, monkeypatch):
@@ -1150,7 +1215,7 @@ def test_archive_and_delete_history_tasks(client):
 
 
 def test_doubao_key_is_read_from_env_but_not_leaked(tmp_path, monkeypatch):
-    dummy_key = "ark-test-secret-value-1234567890"
+    dummy_key = "test-key"
     monkeypatch.setenv("LLM_PROVIDER", "doubao")
     monkeypatch.setenv("DOUBAO_API_KEY", dummy_key)
     monkeypatch.delenv("DOUBAO_ENDPOINT_ID", raising=False)
@@ -1170,18 +1235,18 @@ def test_doubao_key_is_read_from_env_but_not_leaked(tmp_path, monkeypatch):
 
 
 def test_recursive_sanitizer_redacts_bearer_and_high_entropy_tokens():
-    secret = "Bearer aark-test-secret-value-1234567890"
+    bearer = "Bearer test-token"
     volc_like = "w4dtzhmaKYAZZKiaVUHHkLYzgYdnCRKi"
-    payload = sanitize_payload({"tool_calls": [{"headers": {"Authorization": secret}, "api_key": volc_like}]})
+    payload = sanitize_payload({"tool_calls": [{"headers": {"Authorization": bearer}, "api_key": volc_like}]})
     serialized = json.dumps(payload, ensure_ascii=False)
-    assert "aark-test-secret" not in serialized
+    assert "test-token" not in serialized
     assert volc_like not in serialized
     assert "[REDACTED" in serialized
 
 
 def test_doubao_timeout_falls_back_without_500(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "doubao")
-    monkeypatch.setenv("DOUBAO_API_KEY", "ark-test-secret-value-1234567890")
+    monkeypatch.setenv("DOUBAO_API_KEY", "test-key")
     monkeypatch.setenv("DOUBAO_ENDPOINT_ID", "ep-test")
 
     def fake_urlopen(request, timeout):
@@ -1199,7 +1264,7 @@ def test_doubao_timeout_falls_back_without_500(tmp_path, monkeypatch):
 
 def test_doubao_provider_accepts_schema_valid_response(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "doubao")
-    monkeypatch.setenv("DOUBAO_API_KEY", "ark-test-secret-value-1234567890")
+    monkeypatch.setenv("DOUBAO_API_KEY", "test-key")
     monkeypatch.setenv("DOUBAO_ENDPOINT_ID", "ep-test")
 
     class FakeResponse:
@@ -1221,7 +1286,7 @@ def test_doubao_provider_accepts_schema_valid_response(monkeypatch):
             )
 
     def fake_urlopen(request, timeout):
-        assert request.headers["Authorization"] == "Bearer ark-test-secret-value-1234567890"
+        assert request.headers["Authorization"] == "Bearer test-key"
         return FakeResponse()
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
@@ -1231,6 +1296,112 @@ def test_doubao_provider_accepts_schema_valid_response(monkeypatch):
     )
     assert result.provider == "doubao"
     assert result.claims[0]["source_ids"] == ["src1"]
+
+
+def test_research_questionnaire_uses_deepseek_before_doubao(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-test")
+    monkeypatch.setenv("DOUBAO_API_KEY", "doubao-test-key")
+    monkeypatch.setenv("DOUBAO_ENDPOINT_ID", "ep-test")
+    calls = []
+    response_payload = {
+        "title": "AI 助手用户调研问卷",
+        "description": "DeepSeek generated survey",
+        "sections": [{"section_title": "背景", "questions": [{"id": "Q1", "type": "single_choice", "question_text": "角色？", "options": ["个人"], "required": True}]}],
+        "estimated_time_minutes": 5,
+        "recommended_channels": ["线上问卷"],
+    }
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": json.dumps(response_payload, ensure_ascii=False)}}]}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append({"url": request.full_url, "body": json.loads(request.data.decode("utf-8")), "auth": request.headers["Authorization"]})
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    result = LLMProvider().design_questionnaire(
+        {"industry": "AI", "competitors": ["ChatGPT", "DeepSeek"], "focus_areas": ["功能对比"]},
+        "了解用户如何比较 AI 助手",
+    )
+
+    assert result.provider == "deepseek"
+    assert result.data["sections"]
+    assert result.tool_calls[0]["name"] == "deepseek_chat_completions"
+    assert calls[0]["url"] == "https://api.deepseek.com/chat/completions"
+    assert calls[0]["body"]["model"] == "deepseek-test"
+    assert calls[0]["auth"] == "Bearer deepseek-test-key"
+
+
+def test_research_interview_guide_uses_deepseek(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-test")
+    response_payload = {
+        "title": "AI 助手访谈提纲",
+        "estimated_duration_minutes": 45,
+        "target_profile": "真实用户",
+        "phases": [{"phase": "热身", "duration_minutes": 5, "goals": ["确认背景"], "questions": [{"id": "Q1", "text": "请介绍背景", "probe": ""}]}],
+        "notes_for_interviewer": "记录原话",
+        "dimension_coverage": {"用户画像": ["Q1"]},
+    }
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": json.dumps(response_payload, ensure_ascii=False)}}]}).encode("utf-8")
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: FakeResponse())
+    result = LLMProvider().design_interview_guide(
+        {"industry": "AI", "competitors": ["ChatGPT", "DeepSeek"], "focus_areas": ["用户画像"]},
+        "了解用户选择原因",
+        interview_count=6,
+    )
+
+    assert result.provider == "deepseek"
+    assert result.data["phases"]
+    assert result.tool_calls[0]["name"] == "deepseek_chat_completions"
+
+
+def test_research_deepseek_failure_falls_back_to_local_template(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("DOUBAO_API_KEY", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-test")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"not json"}}]}'
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: FakeResponse())
+    result = LLMProvider().design_questionnaire(
+        {"industry": "AI", "competitors": ["ChatGPT"], "focus_areas": ["功能对比"]},
+        "了解用户需求",
+    )
+
+    assert result.provider == "mock"
+    assert result.used_fallback is True
+    assert "DeepSeek questionnaire generation failed" in result.fallback_reason
+    assert result.data["sections"]
 
 
 def test_manual_action_generates_new_report_version(client):
@@ -1253,8 +1424,47 @@ def test_manual_action_generates_new_report_version(client):
     assert actions[-1]["status"] == "completed"
 
 
+def test_context_menu_revision_updates_selected_report_text(client):
+    task = create_demo_task(client)
+    initial_report = client.get(f"/api/tasks/{task['id']}/report").get_json()
+    claims = client.get(f"/api/tasks/{task['id']}/claims").get_json()
+    target = next((claim for claim in claims if claim["source_ids"]), claims[0])
+    selected_text = target["content"][:160]
+
+    response = client.post(
+        f"/api/tasks/{task['id']}/manual-actions",
+        json={
+            "action": "revise_claim",
+            "user_text": "修正结论：这段应降级为待复核判断，并重新搜索补证后再定稿。",
+            "selected_text": selected_text,
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.get_json()
+    assert payload["interpreted_intent"] == "revise_claim"
+    assert payload["status"] == "completed"
+
+    refreshed_report = client.get(f"/api/tasks/{task['id']}/report").get_json()
+    assert refreshed_report["version"] > initial_report["version"]
+    report_text = json.dumps(refreshed_report["content"], ensure_ascii=False)
+    assert "人工修正待复核" in report_text
+    assert "重新搜索补证" in report_text
+
+    task_payload = client.get(f"/api/tasks/{task['id']}").get_json()
+    actions = task_payload["manual_actions"]
+    assert actions[-1]["interpreted_intent"] == "revise_claim"
+    assert actions[-1]["status"] == "completed"
+    revision_findings = [finding for finding in task_payload["qa_findings"] if finding["finding_type"] == "manual_revision"]
+    assert revision_findings
+    assert revision_findings[-1]["manual_review_state"] in {"awaiting_recheck", "system_rechecked", "needs_more_input"}
+    sources = client.get(f"/api/tasks/{task['id']}/sources").get_json()
+    assert any(source["source_type"] == "manual_input" and "人工修正" in source["title"] for source in sources)
+
+
 def test_manual_confirmation_updates_exact_claim(client):
     task = create_demo_task(client)
+    initial_report = client.get(f"/api/tasks/{task['id']}/report").get_json()
     claims = client.get(f"/api/tasks/{task['id']}/claims").get_json()
     target = next(claim for claim in claims if claim["needs_review"])
 
@@ -1274,6 +1484,127 @@ def test_manual_confirmation_updates_exact_claim(client):
     updated = next(claim for claim in updated_claims if claim["id"] == target["id"])
     assert updated["needs_review"] is False
     assert updated["status"] == "confirmed"
+    assert updated["confidence"] >= 0.85
+    sources = client.get(f"/api/tasks/{task['id']}/sources").get_json()
+    confirmation_sources = [source for source in sources if source["source_type"] == "manual_confirmation"]
+    assert confirmation_sources
+    assert any(source["id"] in updated["source_ids"] for source in confirmation_sources)
+    refreshed_report = client.get(f"/api/tasks/{task['id']}/report").get_json()
+    assert refreshed_report["version"] > initial_report["version"]
+
+
+def test_manual_dispute_lowers_confidence_and_creates_finding(client):
+    task = create_demo_task(client)
+    initial_report = client.get(f"/api/tasks/{task['id']}/report").get_json()
+    claims = client.get(f"/api/tasks/{task['id']}/claims").get_json()
+    target = next((claim for claim in claims if claim["section"] == "overview"), claims[0])
+
+    response = client.post(
+        f"/api/tasks/{task['id']}/manual-actions",
+        json={
+            "user_text": "我质疑这条结论不准确，请打回重写并降级置信度。",
+            "selected_text": target["content"],
+            "claim_id": target["id"],
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.get_json()
+    assert payload["interpreted_intent"] == "dispute_claim"
+    updated_claims = client.get(f"/api/tasks/{task['id']}/claims").get_json()
+    updated = next(claim for claim in updated_claims if claim["id"] == target["id"])
+    assert updated["needs_review"] is True
+    assert updated["status"] == "needs_review"
+    assert updated["confidence"] <= 0.45
+    assert "人工质疑" in updated["uncertainty"]
+    task_payload = client.get(f"/api/tasks/{task['id']}").get_json()
+    manual_disputes = [finding for finding in task_payload["qa_findings"] if finding["finding_type"] == "manual_dispute"]
+    assert manual_disputes
+    assert manual_disputes[-1]["claim_id"] == target["id"]
+    assert manual_disputes[-1]["fix_status"] == "open"
+    assert manual_disputes[-1]["manual_review_state"] == "needs_more_input"
+    refreshed_report = client.get(f"/api/tasks/{task['id']}/report").get_json()
+    assert refreshed_report["version"] > initial_report["version"]
+
+
+def test_manual_supplement_binds_source_to_claim_and_closes_after_recheck(client):
+    task = create_demo_task(client)
+    db_path = client.application.config["DATABASE"]
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        source = conn.execute("SELECT id FROM sources WHERE task_id = ? ORDER BY rowid LIMIT 1", (task["id"],)).fetchone()
+        claim_id = "manual-supplement-claim"
+        finding_id = "manual-supplement-finding"
+        conn.execute(
+            """
+            INSERT INTO claims
+            (id, task_id, section, content, confidence, source_ids, generated_agent, needs_review, status, uncertainty, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                claim_id,
+                task["id"],
+                "overview",
+                "人工补证测试结论：需要把补充 URL 绑定回原 claim。",
+                0.61,
+                json.dumps([source["id"]], ensure_ascii=False),
+                "分析 Agent",
+                1,
+                "needs_review",
+                "等待人工补充来源后复核。",
+                utc_now_iso(),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO qa_findings
+            (id, task_id, claim_id, severity, reason, target_agent, finding_type, action_hint, meta_json, fix_status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                finding_id,
+                task["id"],
+                claim_id,
+                "medium",
+                "测试：该结论需要人工补充来源。",
+                "分析 Agent",
+                "missing_source",
+                "补充 URL 后重新质检。",
+                json.dumps({"repair_action": "manual_supplement"}, ensure_ascii=False),
+                "open",
+                utc_now_iso(),
+            ),
+        )
+
+    response = client.post(
+        f"/api/tasks/{task['id']}/qa/findings/{finding_id}/repair",
+        json={
+            "action": "manual_supplement",
+            "user_text": "来源链接：https://example.com/qa-proof 这份材料能证明该结论。",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.get_json()["status"] == "completed"
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        claim = conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
+        source_ids = json.loads(claim["source_ids"])
+        manual_source = conn.execute(
+            "SELECT * FROM sources WHERE task_id = ? AND source_type = 'manual_url' ORDER BY collected_at DESC LIMIT 1",
+            (task["id"],),
+        ).fetchone()
+        finding = conn.execute("SELECT fix_status, meta_json FROM qa_findings WHERE id = ?", (finding_id,)).fetchone()
+    assert manual_source["id"] in source_ids
+    assert claim["confidence"] >= 0.72
+    assert claim["needs_review"] == 1
+    assert finding["fix_status"] == "fixed"
+    finding_meta = json.loads(finding["meta_json"])
+    assert finding_meta["manual_source_id"] == manual_source["id"]
+    assert finding_meta["manual_review_state"] == "system_rechecked"
+    task_payload = client.get(f"/api/tasks/{task['id']}").get_json()
+    api_finding = next(item for item in task_payload["qa_findings"] if item["id"] == finding_id)
+    assert api_finding["manual_review_state"] == "system_rechecked"
 
 
 def test_reportable_claim_requires_source():
@@ -1523,9 +1854,9 @@ def test_pricing_section_uses_business_wording(client):
 
 
 def test_doubao_flow_records_provider_without_leaking_key(tmp_path, monkeypatch):
-    secret = "ark-test-secret-value-1234567890"
+    test_key = "test-key"
     monkeypatch.setenv("LLM_PROVIDER", "doubao")
-    monkeypatch.setenv("DOUBAO_API_KEY", secret)
+    monkeypatch.setenv("DOUBAO_API_KEY", test_key)
     monkeypatch.setenv("DOUBAO_ENDPOINT_ID", "ep-test")
 
     class FakeResponse:
@@ -1602,13 +1933,13 @@ def test_doubao_flow_records_provider_without_leaking_key(tmp_path, monkeypatch)
     assert "doubao_chat_completions" in serialized
     assert any(log["model_provider"] == "doubao" for log in logs)
     assert any(log["agent_name"] == "采集 Agent" and log["model_provider"] == "doubao" for log in logs)
-    assert secret not in serialized
+    assert test_key not in serialized
 
 
 def test_realtime_collection_logs_doubao_query_plan(tmp_path, monkeypatch):
-    secret = "ark-test-secret-value-1234567890"
+    test_key = "test-key"
     monkeypatch.setenv("LLM_PROVIDER", "doubao")
-    monkeypatch.setenv("DOUBAO_API_KEY", secret)
+    monkeypatch.setenv("DOUBAO_API_KEY", test_key)
     monkeypatch.setenv("DOUBAO_ENDPOINT_ID", "ep-test")
 
     class FakeResponse:
@@ -1698,7 +2029,7 @@ def test_realtime_collection_logs_doubao_query_plan(tmp_path, monkeypatch):
     assert "collection_query_plan" in serialized
     assert "doubao_chat_completions" in serialized
     assert "定价" in serialized
-    assert secret not in serialized
+    assert test_key not in serialized
 
 
 def test_swot_outputs_direct_items(client):
@@ -1919,6 +2250,51 @@ def test_report_frontend_uses_linked_toc_and_app_market_visual_panel():
     assert "isReferenceSourceTitle" in js
     assert "ordered-table" in js
     assert "renderTableCellContent" in js
+    assert "function appendTextWithExplicitSourceRefs" in js
+    assert "function sourceRecordForCitationNumber" in js
+    assert "sourceCitationLabel(source, ref)" in js
+    assert "function appendTextWithBracketedSourceRefs" in js
+    assert "function sourceNumbersFromBracketContent" in js
+    assert "function cleanSourceRefToken" in js
+    assert "function hasSourceCue" in js
+    assert "findingStatusLabel" in js
+    assert "findingRecheckText" in js
+    assert "manual_review_state" in js
+    assert "待复核/复检中" in js
+    assert "系统复检通过" in js
+    assert "人工确认已修复" in js
+    assert 'finding.fix_status === "fixed"' in js
+    assert "【" in js and "［" in js
+    assert "allowPlainNumber" in js
+    assert "bracket !== \"(\" && bracket !== \"（\"" in js
+    assert "isInternalSourceIdToken(content)" in js
+    assert "来源|出处)[：:]?\\\\s*" in js
+    assert "appendTextWithBracketedSourceRefs(node, part)" in js
+    assert "function stripInternalSourceIdsForDisplay" in js
+    assert "function replaceInternalSourceIdsWithCatalogRefs" in js
+    assert "function catalogSourceRecordForRef" in js
+    assert "function hasSourceCueForDisplay" in js
+    assert "(?![A-Za-z0-9_])" in js
+    assert "manualQaAction" in js
+    assert "revise_claim" in js
+    assert "actionMap" in js
+    manual_form_block = js[js.index("async function submitManualForm"):js.index("function toggleReportMode")]
+    assert "manualSubmitting" in js
+    assert "manualSubmitButton" in (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+    assert "$(\"#manualSubmitButton\").addEventListener(\"click\"" in js
+    assert "submitManualTextForTask" in js
+    assert "repairQaFindingForTask" in js
+    assert "backgroundTask.finally" in manual_form_block
+    assert "const findingId = state.manualFindingId" in manual_form_block
+    assert "closeManualModal();" in manual_form_block
+    assert "show(\"#boardView\");" in manual_form_block
+    assert "animatePlan(true);" in manual_form_block
+    assert "await submitManualText(" not in manual_form_block
+    assert "await repairQaFinding(" not in manual_form_block
+    assert "重跑中..." in js
+    assert "质疑/打回" in js
+    assert "dispute_claim" in js
+    assert "manual_confirmation" in js
     assert "renderPositioningMap" not in visual_block
     assert "renderPricingBars" not in visual_block
     assert "renderReviewSummary" not in visual_block
@@ -1979,6 +2355,9 @@ def test_pdf_template_uses_toc_sections_and_app_market_visualization():
     assert "_source_catalog_flows" in pdf_source
     assert "_trailing_pdf_citations" in pdf_source
     assert "append_citations: bool = False" in pdf_source
+    assert "def _pdf_source_ref_markup" in pdf_source
+    assert "result[match.group(1)]" in pdf_source
+    assert "source_catalog=source_catalog" in pdf_source
     assert "_report_item_section_index" in pdf_source
     assert "可视化总览" in block
     assert "参考文献（来源链接）" in block
@@ -2001,6 +2380,56 @@ def test_pdf_template_uses_toc_sections_and_app_market_visualization():
     assert "SWOT 分析" not in block
     assert "关键洞察" not in block
     assert "_write_report_pdf_file" in (ROOT / "orchestrator.py").read_text(encoding="utf-8")
+
+
+def test_pdf_inline_numeric_references_are_linked():
+    from report_pdf import _build_pdf_source_ref_labels, _build_pdf_source_ref_urls, _md_inline
+
+    content = {
+        "source_catalog": [
+            {"id": "src_a", "ref": "S9", "url_or_path": "https://example.com/a"},
+            {"id": "src_b", "ref": "S29", "url_or_path": "https://example.com/b"},
+            {"id": "54e81a36_ga_03_03", "ref": "S76", "url_or_path": "https://example.com/c"},
+            {"id": "54e81a36_volc_189", "ref": "S32", "url_or_path": "https://example.com/d"},
+        ]
+    }
+    source_ref_urls = _build_pdf_source_ref_urls(content)
+    source_ref_labels = _build_pdf_source_ref_labels(content)
+
+    assert source_ref_urls["S9"] == "https://example.com/a"
+    assert source_ref_urls["9"] == "https://example.com/a"
+    assert source_ref_urls["[9]"] == "https://example.com/a"
+    assert source_ref_urls["54e81a36_ga_03_03"] == "https://example.com/c"
+    assert source_ref_labels["54e81a36_ga_03_03"] == "76"
+    rendered = _md_inline(
+        "model commercialization [9][29] plus [54e81a36_ga_03_03] and [54e81a36_volc_189]",
+        url_refs={},
+        source_catalog=content["source_catalog"],
+        append_citations=False,
+    )
+
+    assert 'href="https://example.com/a"' in rendered
+    assert 'href="https://example.com/b"' in rendered
+    assert 'href="https://example.com/c"' in rendered
+    assert 'href="https://example.com/d"' in rendered
+    assert '<super>[9]</super>' in rendered
+    assert '<super>[29]</super>' in rendered
+    assert '<super>[76]</super>' in rendered
+    assert '<super>[32]</super>' in rendered
+    assert "54e81a36_ga_03_03" not in rendered
+    assert "54e81a36_volc_189" not in rendered
+
+    cue_rendered = _md_inline(
+        "豆包[来源: 54e81a36_ga_03_03]，DeepSeek[来源：54e81a36_volc_189。]，未知[来源: 54e81a36_search_404。]",
+        url_refs={},
+        source_catalog=content["source_catalog"],
+        append_citations=False,
+    )
+    assert '<super>[76]</super>' in cue_rendered
+    assert '<super>[32]</super>' in cue_rendered
+    assert "54e81a36" not in cue_rendered
+    assert "来源" not in cue_rendered
+    assert "search_404" not in cue_rendered
 
 
 def test_analysis_artifact_preserves_markdown_and_marks_unsupported_terms():
@@ -2059,16 +2488,108 @@ def test_provider_status_reports_provider_timeouts(tmp_path, monkeypatch):
     monkeypatch.setenv("REACT_AGENT_PROVIDER", "auto")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
     monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-test")
+    monkeypatch.setenv("ZHIPU_API_KEY", "zhipu-test-key")
+    monkeypatch.setenv("ZHIPU_MODEL", "your-zhipu-model")
     monkeypatch.setenv("DOUBAO_API_KEY", "doubao-test-key")
     monkeypatch.setenv("DOUBAO_ENDPOINT_ID", "ep-test")
     monkeypatch.setenv("DEEPSEEK_REACT_MAX_SECONDS", "900")
+    monkeypatch.setenv("ZHIPU_REACT_MAX_SECONDS", "600")
     monkeypatch.setenv("DOUBAO_REACT_MAX_SECONDS", "450")
     app = create_app({"TESTING": True, "DATABASE": str(tmp_path / "provider.db"), "WORKFLOW_ASYNC": False})
     payload = app.test_client().get("/api/provider-status").get_json()["react_report"]
     assert payload["configured_provider"] == "deepseek-react"
     assert payload["react_timeout_seconds"]["deepseek-react"] == 900
+    assert payload["react_timeout_seconds"]["zhipu-react"] == 600
     assert payload["react_timeout_seconds"]["doubao-react"] == 450
-    assert [item["provider"] for item in payload["preferred_order"]][:2] == ["deepseek-react", "doubao-react"]
+    assert [item["provider"] for item in payload["preferred_order"]][:3] == ["deepseek-react", "zhipu-react", "doubao-react"]
+
+
+def test_initial_workflow_records_top_level_langgraph_trace(client):
+    task = create_demo_task(client)
+    logs = client.get(f"/api/tasks/{task['id']}/logs").get_json()
+    workflow_run = next(
+        log for log in logs
+        if log["agent_name"] == "编排层" and log["model_provider"] == "langgraph_stategraph"
+    )
+    trace_nodes = [
+        call["workflow_node"]
+        for call in workflow_run["tool_calls"]
+        if call.get("name") == "workflow_node_trace"
+    ]
+    assert trace_nodes[:4] == ["prepare", "collect", "analyze", "qa_review"]
+    assert "report" in trace_nodes
+    assert trace_nodes[-1] == "complete"
+
+    events = client.get(f"/api/tasks/{task['id']}/events").get_json()
+    workflow_events = [
+        event for event in events
+        if event["meta"].get("workflow_engine") == "langgraph_stategraph"
+    ]
+    assert workflow_events
+    assert {event["meta"].get("workflow_node") for event in workflow_events} >= {"collect", "analyze", "qa_review", "report"}
+
+    report = client.get(f"/api/tasks/{task['id']}/report").get_json()
+    assert report["content"]["metrics"]["workflow_engine"] == "langgraph_stategraph"
+
+
+def test_deepseek_direct_thinking_keeps_quality_path_and_marks_execution_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("REACT_REPORT_ENABLED", "1")
+    monkeypatch.setenv("REACT_AGENT_PROVIDER", "deepseek")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
+    monkeypatch.setenv("DEEPSEEK_DIRECT_THINKING_MODE", "1")
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    monkeypatch.delenv("DOUBAO_API_KEY", raising=False)
+
+    def fake_direct_report(provider, user_task, max_seconds, tool_calls):
+        urls = "\n".join(f"https://example.com/source-{index}" for index in range(1, 8))
+        sections = "\n\n".join(
+            f"## {title}\n{urls}\n" + ("DeepSeek direct thinking 生成的高密度长报告内容。" * 45)
+            for title in react_report_agent.REACT_REPORT_H2
+        )
+        return f"# 竞品调研报告：DeepSeek direct 测试\n\n{sections}", tool_calls + [{"name": "fake_deepseek_direct", "result": "ok"}]
+
+    monkeypatch.setattr(react_report_agent, "_run_deepseek_direct_thinking_report", fake_direct_report)
+
+    result = react_report_agent.run_react_report(
+        {"id": "direct-test", "industry": "AI 工具", "competitors": ["ChatGPT", "DeepSeek"], "focus_areas": []},
+        [{"id": "s1", "title": "Source", "url_or_path": "https://example.com/source-1", "excerpt": "公开来源"}],
+        [{"id": "c1", "content": "ChatGPT 和 DeepSeek 均有公开材料。", "source_ids": ["s1"]}],
+        tmp_path,
+    )
+
+    assert result.provider == "deepseek-react"
+    assert result.execution_mode == "deepseek_direct_thinking"
+    assert any(call.get("deep_report_execution_mode") == "deepseek_direct_thinking" for call in result.tool_calls)
+    assert not any(call.get("deep_report_execution_mode") == "stategraph_react_tools" for call in result.tool_calls)
+
+
+def test_public_docs_and_entrypoint_have_unified_product_port_and_provider_order():
+    files = [
+        ROOT / "README.md",
+        ROOT / "docs" / "DEPLOYMENT.md",
+        ROOT / "docs" / "ARCHITECTURE.md",
+        ROOT / "docs" / "AGENT_PROTOCOL.md",
+        ROOT / "docs" / "REPORT_TARGET_SPEC.md",
+        ROOT / ".env.example",
+        ROOT / "app.py",
+    ]
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in files)
+    for marker in [
+        "第五" + "版",
+        "新" + "四版",
+        "新" + "三版",
+        "新" + "一版",
+        "50" + "07",
+        "50" + "12",
+        "50" + "10",
+        "豆包为" + "主",
+        "豆包真" + "实",
+    ]:
+        assert marker not in combined
+    assert "MOSS多agent智能竞品分析系统——小莫" in combined
+    assert "127.0.0.1:5016" in combined
+    assert "DeepSeek -> 智谱 -> 豆包" in combined
+    assert "ZHIPU_MODEL=your-zhipu-model" in combined
 
 
 def test_explicit_deepseek_provider_disables_doubao_react_failover(monkeypatch):

@@ -22,6 +22,8 @@ const state = {
   activeModalKey: "",
   manualFindingId: "",
   manualClaimId: "",
+  manualQaAction: "",
+  manualSubmitting: false,
   questionnaireDesigns: [],
   surveyAnalyses: [],
   interviewAnalyses: [],
@@ -454,6 +456,41 @@ function statusLabel(status = "") {
   }[status] || status || "等待中";
 }
 
+function manualFindingReviewState(finding = {}) {
+  return finding.manual_review_state || (finding.meta && finding.meta.manual_review_state) || "";
+}
+
+function findingStatusLabel(finding = {}) {
+  const reviewState = manualFindingReviewState(finding);
+  if (reviewState === "awaiting_recheck") return "待复核/复检中";
+  if (reviewState === "system_rechecked") return "系统复检通过";
+  if (reviewState === "manual_confirmed") return "人工确认已修复";
+  if (reviewState === "needs_more_input") return "需继续补充";
+  if (finding.fix_status === "fixed") return "系统复检通过";
+  return statusLabel(finding.fix_status);
+}
+
+function findingStatusClass(finding = {}) {
+  const reviewState = manualFindingReviewState(finding);
+  if (["system_rechecked", "manual_confirmed"].includes(reviewState)) return "pass";
+  if (reviewState === "needs_more_input") return "danger";
+  if (reviewState === "awaiting_recheck") return "warn";
+  return statusClass(finding.fix_status);
+}
+
+function findingRecheckText(finding = {}, canRecheckWithoutInput = false) {
+  if (finding.recheck_result) return finding.recheck_result;
+  const reviewState = manualFindingReviewState(finding);
+  if (reviewState === "awaiting_recheck") return "已收到人工补充或修正，等待系统复检。";
+  if (reviewState === "system_rechecked") return "系统自动复检已通过，报告版本已刷新。";
+  if (reviewState === "manual_confirmed") return "用户已确认无误，结论已记录为人工确认。";
+  if (reviewState === "needs_more_input") return "复检仍未通过，请继续补充来源、修订结论或打回。";
+  if (finding.fix_status === "fixed") return "系统自动复检已通过，报告版本已刷新。";
+  return canRecheckWithoutInput
+    ? "已发生修复动作，可重新质检。"
+    : "未修复：直接重新质检不会通过，请先执行修复动作或补充材料。";
+}
+
 function providerLabel(value = "") {
   const raw = String(value || "").trim();
   if (raw.includes("、") || raw.includes("/")) {
@@ -467,6 +504,7 @@ function providerLabel(value = "") {
     doubao: "豆包大模型",
     "doubao-react": "豆包 ReAct 深度分析",
     "deepseek-react": "DeepSeek ReAct 深度分析",
+    "zhipu-react": "智谱深度分析",
     "local-react-fallback": "本地深度分析备用规则",
     "report-renderer": "报告排版生成",
     mock: "规则模式",
@@ -502,6 +540,7 @@ function sourceTypeLabel(value = "") {
     manual_scope: "任务范围说明",
     manual_input: "人工补充",
     manual_url: "人工补充网址",
+    manual_confirmation: "人工确认",
     demo_scope_note: "缓存范围说明",
     questionnaire_design: "问卷设计",
     interview_guide: "访谈提纲",
@@ -870,9 +909,14 @@ function liveModelStatus(metrics = {}) {
     metrics.react_report_provider,
     metrics.provider_used,
   ].filter(Boolean).join("、");
+  const deepMode = String(metrics.deep_report_execution_mode || "");
   const used = [];
   if (/doubao/i.test(providerText) || metrics.llm_called) used.push("豆包结构化");
-  if (/deepseek-react/i.test(providerText)) used.push("DeepSeek ReAct");
+  if (/deepseek_direct_thinking/i.test(deepMode)) used.push("DeepSeek direct");
+  else if (/deepseek-react/i.test(providerText)) used.push("DeepSeek ReAct");
+  if (/zhipu_direct_safe/i.test(deepMode)) used.push("智谱 direct");
+  else if (/zhipu-react/i.test(providerText)) used.push("智谱深度分析");
+  if (/stategraph_react_tools/i.test(deepMode)) used.push("StateGraph ReAct工具链");
   if (/doubao-react/i.test(providerText)) used.push("豆包 ReAct");
   if (/local-react-fallback|备用规则/i.test(providerText)) used.push("本地规则");
   if (!used.length && providerText) used.push(providerLabel(providerText));
@@ -1030,11 +1074,7 @@ function renderQaCard() {
     children.push(el("div", { className: "qa-item" }, [el("p", { text: "暂无人工复核项；首版报告已通过自动质检。" })]));
   } else {
     state.task.qa_findings.forEach((finding) => {
-      const recheckText =
-        finding.recheck_result ||
-        (finding.can_recheck_without_input
-          ? "已发生修复动作，可重新质检。"
-          : "未修复：直接重新质检不会通过，请先执行修复动作或补充材料。");
+      const recheckText = findingRecheckText(finding, finding.can_recheck_without_input);
       const objectLabel = [
         sectionLabel(finding.claim_section),
         finding.affected_competitor || "综合",
@@ -1054,7 +1094,7 @@ function renderQaCard() {
       children.push(
         el("div", { className: "qa-item" }, [
           el("div", { className: "qa-head" }, [
-            el("span", { className: `badge ${statusClass(finding.fix_status)}`, text: statusLabel(finding.fix_status) }),
+            el("span", { className: `badge ${findingStatusClass(finding)}`, text: findingStatusLabel(finding) }),
             el("span", { className: "badge", text: severityLabel(finding.severity) }),
             el("span", { className: "badge", text: findingTypeLabel(finding.finding_type) }),
           ]),
@@ -1096,6 +1136,18 @@ function renderQaCard() {
               onclick: (event) => repairQaFinding(finding.id, "confirm_uncertainty", event.currentTarget),
               text: "确认无误",
             }),
+            el("button", {
+              className: "mini-button",
+              type: "button",
+              disabled: busy,
+              onclick: () => openManualModal(
+                "",
+                `我质疑这条结论，请打回并降级置信度：${finding.claim_content || finding.reason || ""}`,
+                "qa_finding",
+                { findingId: finding.id, claimId: finding.claim_id, finding, action: "dispute_claim" },
+              ),
+              text: "质疑/打回",
+            }),
           ]),
         ]),
       );
@@ -1136,6 +1188,11 @@ function findingTypeLabel(value = "") {
     duplicate_claim: "重复结论",
     scope_only: "只有范围说明",
     model_review: "模型质检意见",
+    missing_source: "缺少来源",
+    low_confidence_missing_uncertainty: "低置信缺说明",
+    needs_review_missing_uncertainty: "待复核缺说明",
+    manual_evidence_needs_validation: "人工材料待核验",
+    manual_dispute: "人工质疑",
     general: "通用问题",
   }[String(value)] || "通用问题";
 }
@@ -1763,14 +1820,29 @@ function formatRefs(refs = []) {
 }
 
 function sourceRecordForRef(ref) {
-  const key = String(ref || "");
+  const key = cleanSourceRefToken(ref);
   const catalog = (state.report && state.report.content && state.report.content.source_catalog) || [];
+  const numeric = citationNumberFromRef(key);
+  if (numeric) {
+    const byNumber = sourceRecordForCitationNumber(numeric);
+    if (byNumber) return byNumber;
+  }
   const byCatalog = catalog.find((source) => source.ref === key || source.id === key);
   if (byCatalog) return byCatalog;
   const source = (state.sources || []).find((item) => item.id === key);
   if (!source) return null;
   const index = (state.sources || []).findIndex((item) => item.id === key);
   return { id: source.id, ref: `S${index + 1}`, title: source.title, url_or_path: source.url_or_path };
+}
+
+function catalogSourceRecordForRef(ref) {
+  const key = cleanSourceRefToken(ref);
+  const catalog = (state.report && state.report.content && state.report.content.source_catalog) || [];
+  const numeric = citationNumberFromRef(key);
+  if (numeric) {
+    return catalog.find((source) => sourceCitationNumber(source, source.url_or_path || "") === numeric) || null;
+  }
+  return catalog.find((source) => source.ref === key || source.id === key) || null;
 }
 
 function normalizeReferenceUrl(value) {
@@ -1998,17 +2070,192 @@ function isReferenceSourceTitle(title) {
 
 function sourceRefLabel(ref) {
   const source = sourceRecordForRef(ref);
-  return source ? source.ref || ref : ref;
+  const number = source ? sourceCitationNumber(source, source.url_or_path || "") : citationNumberFromRef(ref);
+  return number ? `[${number}]` : String(ref || "");
 }
 
 function renderSingleSourceLink(ref) {
   const source = sourceRecordForRef(ref);
-  const label = source ? source.ref || ref : ref;
+  const label = sourceCitationLabel(source, ref);
   const url = source ? source.url_or_path || "" : "";
   if (/^https?:\/\//i.test(url)) {
     return el("a", { href: url, target: "_blank", rel: "noopener noreferrer", text: label, title: source.title || url });
   }
   return el("button", { className: "source-ref-button", type: "button", onclick: () => openSourcesPanel([source && source.id ? source.id : ref], ref), text: label || "来源" });
+}
+
+function sourceCitationLabel(source, fallbackRef = "") {
+  const number = source ? sourceCitationNumber(source, source.url_or_path || "") : citationNumberFromRef(fallbackRef);
+  return number ? `[${number}]` : String(fallbackRef || "");
+}
+
+function citationNumberFromRef(ref) {
+  const match = cleanSourceRefToken(ref).match(/^(?:S)?(\d+)$/i);
+  return match ? match[1] : "";
+}
+
+function cleanSourceRefToken(value) {
+  let token = String(value || "").trim();
+  for (let index = 0; index < 3; index += 1) {
+    token = token
+      .replace(/^(?:资料来源|参考来源|来源|出处)\s*[：:]?\s*/g, "")
+      .replace(/^[\[\]［］【】（）()\s]+|[\[\]［］【】（）()\s]+$/g, "")
+      .replace(/[，,。；;、.]+$/g, "")
+      .trim();
+  }
+  return token;
+}
+
+function hasSourceCue(value) {
+  return /(?:资料来源|参考来源|来源|出处)\s*[：:]?/i.test(String(value || ""));
+}
+
+function isInternalSourceIdToken(value) {
+  return /^[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|cache|source|src|input|url)[A-Za-z0-9_]*$/i.test(cleanSourceRefToken(value));
+}
+
+function sourceRecordForCitationNumber(number) {
+  const target = String(number || "").trim();
+  if (!target) return null;
+  const catalog = (state.report && state.report.content && state.report.content.source_catalog) || [];
+  const catalogMatch = catalog.find((source) =>
+    sourceCitationNumber(source, source.url_or_path || "") === target ||
+    String(source.ref || "").toLowerCase() === `s${target}`,
+  );
+  if (catalogMatch) return catalogMatch;
+  const localSources = (state.sources || []).map((source, index) => ({
+    id: source.id,
+    ref: `S${index + 1}`,
+    title: source.title,
+    url_or_path: source.url_or_path,
+  }));
+  return localSources.find((source) => sourceCitationNumber(source, source.url_or_path || "") === target) || null;
+}
+
+function renderCitationNumberLink(number) {
+  const source = sourceRecordForCitationNumber(number);
+  const label = sourceCitationLabel(source, number);
+  const url = source ? source.url_or_path || "" : "";
+  if (/^https?:\/\//i.test(url)) {
+    return el("sup", { className: "source-citation" }, [
+      el("a", { href: url, target: "_blank", rel: "noopener noreferrer", text: label, title: source.title || url }),
+    ]);
+  }
+  return el("sup", { className: "source-citation" }, [
+    el("button", {
+      className: "source-ref-button",
+      type: "button",
+      onclick: () => openSourcesPanel([source && source.id ? source.id : `S${number}`], `S${number}`),
+      text: label,
+    }),
+  ]);
+}
+
+function citationNumbersFromText(value) {
+  const refs = [];
+  String(value || "").replace(/\[?S?(\d+)\]?(?![A-Za-z0-9_])(?:\s*[-–—]\s*\[?S?(\d+)\]?(?![A-Za-z0-9_]))/gi, (_match, start, end) => {
+    const from = Number(start);
+    const to = Number(end);
+    if (Number.isFinite(from) && Number.isFinite(to) && to >= from && to - from <= 20) {
+      for (let value = from; value <= to; value += 1) refs.push(String(value));
+    }
+    return "";
+  });
+  String(value || "")
+    .replace(/\[?S?\d+\]?(?![A-Za-z0-9_])\s*[-–—]\s*\[?S?\d+\]?(?![A-Za-z0-9_])/gi, " ")
+    .replace(/\[?S?(\d+)\]?(?![A-Za-z0-9_])/gi, (_match, number) => {
+      refs.push(String(number));
+      return "";
+    });
+  return Array.from(new Set(refs));
+}
+
+function appendTextWithExplicitSourceRefs(node, value) {
+  const text = String(value || "");
+  const internalId = String.raw`[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|cache|source|src|input|url)[A-Za-z0-9_]*`;
+  const bracketedNumeric = String.raw`(?:[\[［【]?\s*S?\d+\s*[\]］】]?)`;
+  const sourceToken = String.raw`(?:${bracketedNumeric}|${internalId})(?![A-Za-z0-9_])`;
+  const pattern = new RegExp(`(?:资料来源|参考来源|来源|出处)[：:]?\\s*(${sourceToken}(?:\\s*(?:[、,，/;；]|和|及|-|–|—)\\s*${sourceToken})*)\\s*[，,。；;、.]*`, "gi");
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(text))) {
+    if (match.index > cursor) node.append(document.createTextNode(text.slice(cursor, match.index)));
+    const numbers = sourceNumbersFromBracketContent(match[1]);
+    if (numbers.length) {
+      numbers.forEach((number) => node.append(renderCitationNumberLink(number)));
+    }
+    cursor = pattern.lastIndex;
+  }
+  if (cursor < text.length) node.append(document.createTextNode(text.slice(cursor)));
+}
+
+function sourceNumbersFromBracketContent(value, options = {}) {
+  const refs = [];
+  const allowPlainNumber = options.allowPlainNumber !== false;
+  const normalized = String(value || "").replace(/^(?:资料来源|参考来源|来源|出处)\s*[：:]?\s*/g, "");
+  normalized
+    .split(/\s*(?:[、,，/;；]|和|及|-|–|—)\s*/)
+    .forEach((item) => {
+      const cleaned = cleanSourceRefToken(item);
+      if (!cleaned) return;
+      const source = catalogSourceRecordForRef(cleaned) || sourceRecordForRef(cleaned);
+      if (source) {
+        refs.push(sourceCitationNumber(source, source.url_or_path || ""));
+        return;
+      }
+      if (!allowPlainNumber && /^\d+$/.test(cleaned)) return;
+      const number = citationNumberFromRef(cleaned);
+      if (number) refs.push(number);
+    });
+  return Array.from(new Set(refs.filter(Boolean)));
+}
+
+function appendTextWithBracketedSourceRefs(node, value) {
+  const text = String(value || "");
+  const pattern = /\[\s*([^\]\n]{1,260})\s*\]|［\s*([^］\n]{1,260})\s*］|【\s*([^】\n]{1,260})\s*】|（\s*([^）\n]{1,260})\s*）|\(\s*([^)\n]{1,260})\s*\)/g;
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(text))) {
+    if (match.index > cursor) {
+      appendTextWithExplicitSourceRefs(node, text.slice(cursor, match.index));
+    }
+    const content = match.slice(1).find((item) => item !== undefined) || "";
+    const bracket = match[0].trim().slice(0, 1);
+    const allowPlainNumber = bracket !== "(" && bracket !== "（";
+    const numbers = sourceNumbersFromBracketContent(content, { allowPlainNumber });
+    if (numbers.length) {
+      numbers.forEach((number) => node.append(renderCitationNumberLink(number)));
+    } else if (!hasSourceCue(content) && !isInternalSourceIdToken(content)) {
+      appendTextWithExplicitSourceRefs(node, match[0]);
+    }
+    cursor = pattern.lastIndex;
+  }
+  if (cursor < text.length) appendTextWithExplicitSourceRefs(node, text.slice(cursor));
+}
+
+function replaceInternalSourceIdsWithCatalogRefs(value) {
+  return String(value || "").replace(
+    /\b[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|cache|source|src|input|url)[A-Za-z0-9_]*\b/gi,
+    (sourceId) => {
+      const source = catalogSourceRecordForRef(sourceId);
+      return source && source.ref ? source.ref : "";
+    },
+  );
+}
+
+function stripInternalSourceIdsForDisplay(value) {
+  return String(value || "")
+    .replace(/（\s*(?:资料来源|参考来源|来源|出处)[：:]?\s*(?:[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|cache|source|src|input|url)[A-Za-z0-9_]*(?:\s*[、,，/]\s*)?)+\s*）/gi, "")
+    .replace(/\(\s*(?:资料来源|参考来源|来源|出处)[：:]?\s*(?:[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|cache|source|src|input|url)[A-Za-z0-9_]*(?:\s*[、,，/]\s*)?)+\s*\)/gi, "")
+    .replace(/(?:资料来源|参考来源|来源|出处)[：:]?\s*(?:[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|cache|source|src|input|url)[A-Za-z0-9_]*(?:\s*[、,，/]\s*)?)+/gi, "")
+    .replace(/\b[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|cache|source|src|input|url)[A-Za-z0-9_]*\b/gi, "")
+    .replace(/[\[［]\s*(?:资料来源|参考来源|来源|出处)[：:]?\s*[，,。；;、.\s]*[\]］]/gi, "")
+    .replace(/[（(]\s*(?:资料来源|参考来源|来源|出处)[：:]?\s*[，,。；;、.\s]*[）)]/gi, "")
+    .replace(/（\s*）|\(\s*\)/g, "")
+    .replace(/\s+([，,。；;）)])/g, "$1")
+    .replace(/([（(])\s+/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function renderEvidenceRefs(refs = []) {
@@ -2241,10 +2488,11 @@ function escapeRegExp(value) {
 
 function renderMarkdownInline(tag, text, options = {}) {
   const node = el(tag, {});
-  const cleanedText = String(text || "").replace(
-    /(^|[\s（(，,；;。])(?:资料来源|参考来源|来源|出处)[:：]\s*(?=(?:https?:\/\/|\[[^\]]+\]\(https?:\/\/))/g,
-    "$1",
-  );
+  const sourceNormalizedText = replaceInternalSourceIdsWithCatalogRefs(text);
+  const cleanedText = stripInternalSourceIdsForDisplay(sourceNormalizedText).replace(
+      /(^|[\s（(，,；;。])(?:资料来源|参考来源|来源|出处)[:：]\s*(?=(?:https?:\/\/|\[[^\]]+\]\(https?:\/\/))/g,
+      "$1",
+    );
   const parts = cleanedText.split(/(\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^)]+\)|https?:\/\/[^\s)\]）}，。；、]+)/g);
   parts.forEach((part) => {
     if (!part) return;
@@ -2271,7 +2519,7 @@ function renderMarkdownInline(tag, text, options = {}) {
       node.append(...renderSourceCitationFromUrl(part));
       return;
     }
-    node.append(document.createTextNode(part));
+    appendTextWithBracketedSourceRefs(node, part);
   });
   return options.appendCitations ? appendTrailingCitations(node, text) : node;
 }
@@ -2369,11 +2617,12 @@ function renderTable(rows, options = {}) {
 
 function renderTableCellContent(cell, allowColonLabel = true) {
   const text = String(cell ?? "");
+  const shouldAppendCitations = allowColonLabel && hasSourceCueForDisplay(text);
   if (allowColonLabel) {
     const match = text.match(/^([^：:\n]{2,28})([：:])\s*(.+)$/);
     if (match && !/^https?$/i.test(match[1])) {
       const label = cleanMarkdownLinkLabel(match[1]);
-      const rest = renderMarkdownInline("span", match[3]);
+      const rest = renderMarkdownInline("span", match[3], { appendCitations: shouldAppendCitations });
       return el("span", { className: "table-cell-labeled" }, [
         el("strong", { text: `${label || match[1]}${match[2]}` }),
         document.createTextNode(" "),
@@ -2381,7 +2630,11 @@ function renderTableCellContent(cell, allowColonLabel = true) {
       ]);
     }
   }
-  return renderMarkdownInline("span", text);
+  return renderMarkdownInline("span", text, { appendCitations: shouldAppendCitations });
+}
+
+function hasSourceCueForDisplay(value) {
+  return /(?:资料来源|参考来源|来源|出处|[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|cache|source|src|input|url)[A-Za-z0-9_]*)/i.test(String(value || ""));
 }
 
 function openSectionModal(section) {
@@ -2568,56 +2821,124 @@ function openManualModal(selectedText = "", prompt = "", mode = "global", option
   state.selectedText = hasSelectedText ? selectedText : "";
   state.manualFindingId = options.findingId || "";
   state.manualClaimId = options.claimId || "";
-  $("#manualTitle").textContent = mode === "qa_finding" ? "按质检建议补充来源/材料" : hasSelectedText ? "复查这条结论" : "人工复查/补充材料";
+  state.manualQaAction = options.action || (hasSelectedText ? "revise_claim" : "manual_supplement");
+  $("#manualTitle").textContent = mode === "qa_finding"
+    ? (state.manualQaAction === "dispute_claim" ? "质疑/打回这条结论" : "按质检建议补充来源/材料")
+    : hasSelectedText ? "复查这条结论" : "人工复查/补充材料";
   setHidden("#selectedTextField", !hasSelectedText);
   $("#selectedTextInput").value = hasSelectedText ? selectedText : "";
   renderManualGuide(mode, options);
-  $("#manualTextLabel").textContent = mode === "qa_finding" ? "请粘贴来源、材料摘要或人工确认说明" : "复查说明";
+  $("#manualTextLabel").textContent = mode === "qa_finding"
+    ? (state.manualQaAction === "dispute_claim" ? "请说明质疑原因、错误点或需要降级的依据" : "请粘贴来源、材料摘要或人工确认说明")
+    : (state.manualQaAction === "revise_claim" ? "修正说明" : "复查说明");
   $("#manualTextInput").value = prompt;
   $("#manualTextInput").setAttribute(
     "placeholder",
     mode === "qa_finding"
-      ? "按上方建议粘贴网址、材料原文、文件摘要，或说明为什么该结论可以确认/需要降级。"
-      : hasSelectedText ? "例如：这段结论证据不够，请补充来源后重新质检。" : "例如：请复查开放质检问题，并补充缺失来源或不确定性说明。",
+      ? (state.manualQaAction === "dispute_claim"
+        ? "例如：这条判断不准确，缺少某竞品官方来源，请打回并重新补证。"
+        : "按上方建议粘贴网址、材料原文、文件摘要，或说明为什么该结论可以确认/需要降级。")
+      : hasSelectedText ? "例如：这段结论不准确，应改为……；请重新搜索/质检并更新该段。" : "例如：请复查开放质检问题，并补充缺失来源或不确定性说明。",
   );
   setHidden("#manualBackdrop", false);
   $("#manualTextInput").focus();
 }
 
-async function submitManualText(userText, selectedText = "", claimId = "", button = null) {
+function closeManualModal() {
+  state.manualFindingId = "";
+  state.manualClaimId = "";
+  state.manualQaAction = "";
+  setHidden("#manualBackdrop", true);
+}
+
+async function submitManualText(userText, selectedText = "", claimId = "", button = null, action = "") {
   if (!state.task) return;
-  await withButtonLoading(button, "确认中...", async () => {
+  const manualAction = action || state.manualQaAction || (selectedText ? "revise_claim" : "manual_supplement");
+  await withButtonLoading(button, manualAction === "revise_claim" ? "重跑中..." : "确认中...", async () => {
     try {
-      await api(`/api/tasks/${state.task.id}/manual-actions`, {
+      if (manualAction === "revise_claim") {
+        showToast("已提交修正：正在重跑相关分析、质检并生成新报告...", "info");
+      }
+      const result = await api(`/api/tasks/${state.task.id}/manual-actions`, {
         method: "POST",
-        body: JSON.stringify({ user_text: userText, selected_text: selectedText, claim_id: claimId }),
+        body: JSON.stringify({ user_text: userText, selected_text: selectedText, claim_id: claimId, action: manualAction }),
       });
       animatePlan(!userText.includes("确认"));
       await loadTaskState();
       renderBoard();
       renderReport();
-      showToast(claimId ? "该条结论已人工确认，报告已刷新。" : "人工复查说明已记录，报告已刷新。", "success");
+      if (result.status === "busy") {
+        showToast(result.result_summary || "自动流程仍在运行中，请稍后再试。");
+      } else {
+        showToast(result.result_summary || (claimId ? "该条结论已人工确认，报告已刷新。" : "人工复查说明已记录，报告已刷新。"), "success");
+      }
     } catch (error) {
       showToast(`人工复查失败：${error.message}`, "error");
     }
   });
 }
 
+async function refreshAfterManualBackground(taskId, result, defaultMessage) {
+  if (!state.task || state.task.id !== taskId) return;
+  animatePlan(result && result.status !== "completed");
+  await loadTaskState({ allowMissingReport: true });
+  renderBoard();
+  if (state.report) renderReport();
+  revealTaskNav();
+  if (result && result.status === "busy") {
+    showToast(result.result_summary || "自动流程仍在运行中，请稍后查看任务页。");
+  } else {
+    showToast((result && result.result_summary) || defaultMessage, (result && result.status === "needs_review") ? "info" : "success");
+  }
+}
+
+async function submitManualTextForTask(taskId, userText, selectedText = "", claimId = "", action = "") {
+  const manualAction = action || (selectedText ? "revise_claim" : "manual_supplement");
+  try {
+    const result = await api(`/api/tasks/${taskId}/manual-actions`, {
+      method: "POST",
+      body: JSON.stringify({ user_text: userText, selected_text: selectedText, claim_id: claimId, action: manualAction }),
+    });
+    await refreshAfterManualBackground(taskId, result, "复核已完成，报告版本已刷新。");
+  } catch (error) {
+    showToast(`人工复核后台提交失败：${error.message}`, "error");
+  }
+}
+
+async function repairQaFindingForTask(taskId, findingId, action = "manual_supplement", userText = "") {
+  try {
+    const result = await api(`/api/tasks/${taskId}/qa/findings/${findingId}/repair`, {
+      method: "POST",
+      body: JSON.stringify({ action, user_text: userText }),
+    });
+    await refreshAfterManualBackground(taskId, result, "质检问题复核已完成，报告版本已刷新。");
+  } catch (error) {
+    showToast(`质检问题后台复核失败：${error.message}`, "error");
+  }
+}
+
 async function submitManualForm(event) {
-  event.preventDefault();
+  if (event) event.preventDefault();
+  if (state.manualSubmitting) return;
   const text = $("#manualTextInput").value.trim();
   if (!text) return;
-  if (state.manualFindingId) {
-    await repairQaFinding(state.manualFindingId, "manual_supplement", null, text);
-    state.manualFindingId = "";
-    state.manualClaimId = "";
-    setHidden("#manualBackdrop", true);
-    show("#boardView");
-    return;
-  }
-  await submitManualText(text, $("#selectedTextInput").value);
-  setHidden("#manualBackdrop", true);
+  if (!state.task || !state.task.id) return;
+  state.manualSubmitting = true;
+  const taskId = state.task.id;
+  const findingId = state.manualFindingId;
+  const claimId = state.manualClaimId;
+  const action = state.manualQaAction;
+  const selectedText = $("#selectedTextInput").value;
+  closeManualModal();
   show("#boardView");
+  animatePlan(true);
+  showToast("已提交复核请求，正在重跑相关采集、分析、质检和报告步骤...", "info");
+  const backgroundTask = findingId
+    ? repairQaFindingForTask(taskId, findingId, action || "manual_supplement", text)
+    : submitManualTextForTask(taskId, text, selectedText, claimId, action);
+  backgroundTask.finally(() => {
+    state.manualSubmitting = false;
+  });
 }
 
 function toggleReportMode() {
@@ -2673,7 +2994,14 @@ function initContextMenu() {
     const button = event.target.closest("button");
     if (!button) return;
     const action = button.dataset.action;
-    openManualModal(state.selectedText, `${action}：请处理我选中的这段内容。`, "selection");
+    const actionMap = {
+      修正结论: "revise_claim",
+      补充来源: "supplement_source",
+      要求重新搜索: "supplement_source",
+      要求重新质检: "recheck_qa",
+    };
+    setHidden("#contextMenu", true);
+    openManualModal(state.selectedText, `${action}：请处理我选中的这段内容。`, "selection", { action: actionMap[action] || "revise_claim" });
   });
   $("#historyContextMenu").addEventListener("click", async (event) => {
     const button = event.target.closest("button");
@@ -2802,16 +3130,20 @@ function wireEvents() {
   });
   $("#manualTopButton").addEventListener("click", () => {
     if (!$("#manualBackdrop").classList.contains("hidden")) {
-      setHidden("#manualBackdrop", true);
+      closeManualModal();
       return;
     }
     openManualModal("", "可选人工复核：补充来源、修订结论、确认不确定项，或要求重新质检。", "global");
   });
-  $("#closeManualButton").addEventListener("click", () => setHidden("#manualBackdrop", true));
+  $("#closeManualButton").addEventListener("click", closeManualModal);
   $("#manualBackdrop").addEventListener("click", (event) => {
-    if (event.target.id === "manualBackdrop") setHidden("#manualBackdrop", true);
+    if (event.target.id === "manualBackdrop") closeManualModal();
   });
   $("#manualForm").addEventListener("submit", submitManualForm);
+  $("#manualSubmitButton").addEventListener("click", (event) => {
+    event.preventDefault();
+    submitManualForm(event);
+  });
   $("#toggleReportModeButton").addEventListener("click", toggleReportMode);
   $("#cancelDeleteButton").addEventListener("click", closeDeleteDialog);
   $("#cancelDeleteTopButton").addEventListener("click", closeDeleteDialog);
@@ -2824,7 +3156,7 @@ function wireEvents() {
     setHidden("#logPanel", true);
     setHidden("#sourcesPanel", true);
     setHidden("#modalBackdrop", true);
-    setHidden("#manualBackdrop", true);
+    closeManualModal();
     setHidden("#sourceMenu", true);
     setHidden("#deleteBackdrop", true);
     closeResearchPanel();

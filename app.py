@@ -42,7 +42,7 @@ from schema import TaskCreate, utc_now_iso
 
 
 BASE_DIR = Path(__file__).resolve().parent
-APP_VERSION = "20260609a"
+APP_VERSION = "20260620-manual-submit-2"
 DEFAULT_DB = BASE_DIR / "data" / "app.db"
 DATASET_PATH = BASE_DIR / "data" / "demo_dataset.json"
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
@@ -576,6 +576,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def add_security_headers(response):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-App-Version"] = APP_VERSION
+        if request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache, max-age=0"
         response.headers["X-Frame-Options"] = "SAMEORIGIN"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
@@ -1065,9 +1067,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         user_text = sanitize_text(str(payload.get("user_text", "")), 1200)
         selected_text = sanitize_text(str(payload.get("selected_text", "")), 1200)
         claim_id = sanitize_text(str(payload.get("claim_id", "")), 120)
+        action = sanitize_text(str(payload.get("action", "")), 80)
         if not user_text:
             abort(400, "user_text is required")
-        result = orchestrator.handle_manual_action(task_id, user_text, selected_text, claim_id)
+        result = orchestrator.handle_manual_action(task_id, user_text, selected_text, claim_id, action=action)
         return jsonify(result), 201
 
     @app.post("/api/tasks/<task_id>/qa/recheck")
@@ -2049,6 +2052,18 @@ def build_qa_finding_details(conn: sqlite3.Connection, task_id: str) -> list[dic
         section = claim["section"] if claim else ""
         missing_material = meta.get("missing_material") or default_material(finding_type, competitor, section)
         suggested_queries = meta.get("suggested_queries") if isinstance(meta.get("suggested_queries"), list) else []
+        manual_verdict = str(meta.get("manual_verdict") or "")
+        manual_review_state = str(meta.get("manual_review_state") or "")
+        fix_status = item.get("fix_status") or ""
+        if not manual_review_state:
+            if manual_verdict == "confirmed":
+                manual_review_state = "manual_confirmed"
+            elif fix_status == "fixed" and manual_verdict in {"supplemented_source", "revise_claim"}:
+                manual_review_state = "system_rechecked"
+            elif manual_verdict in {"supplemented_source", "revise_claim"} and fix_status in {"open", "manual_pending"}:
+                manual_review_state = "needs_more_input" if item.get("recheck_result") else "awaiting_recheck"
+            elif manual_verdict == "disputed":
+                manual_review_state = "needs_more_input"
         item.update(
             {
                 "finding_type": finding_type,
@@ -2067,7 +2082,10 @@ def build_qa_finding_details(conn: sqlite3.Connection, task_id: str) -> list[dic
                 "suggested_queries": suggested_queries,
                 "supplement_guidance": supplement_guidance(finding_type, competitor, section, claim_text, missing_material, current_sources, suggested_queries),
                 "repair_action": meta.get("repair_action") or ("auto_collect" if finding_type in {"source_ownership_mismatch", "pricing_missing_official", "missing_date"} else "manual_supplement"),
-                "can_recheck_without_input": item.get("fix_status") != "open",
+                "can_auto_repair": bool(meta.get("can_auto_repair", False)),
+                "needs_manual_review": bool(meta.get("needs_manual_review", item.get("fix_status") in {"open", "manual_pending"})),
+                "manual_review_state": manual_review_state,
+                "can_recheck_without_input": item.get("fix_status") != "open" or manual_review_state in {"awaiting_recheck", "needs_more_input"},
             }
         )
         details.append(item)
@@ -2581,4 +2599,4 @@ app = create_app({"TESTING": True}) if "pytest" in sys.modules else create_app()
 
 if __name__ == "__main__":
     app = create_app()
-    app.run(host="127.0.0.1", port=5010, debug=False)
+    app.run(host="127.0.0.1", port=5016, debug=False)

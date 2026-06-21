@@ -131,10 +131,24 @@ class QAFindingRecord(BaseModel):
     finding_type: str = "general"
     action_hint: str = ""
     meta_json: str = "{}"
-    fix_status: Literal["open", "fixed", "waived"] = "open"
+    fix_status: Literal["open", "fixed", "waived", "manual_pending"] = "open"
     recheck_result: str = ""
     created_at: ISODateTime
     fixed_at: str = ""
+
+
+class CompetitiveKnowledgeSchema(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    title: str
+    summary: str = ""
+    feature_tree: list[dict[str, Any]]
+    pricing_model: list[dict[str, Any]]
+    user_persona: list[dict[str, Any]]
+    swot: dict[str, Any] | list[dict[str, Any]]
+    source_catalog: list[dict[str, Any]]
+    methodology: dict[str, Any]
+    chart_data: dict[str, Any]
 
 
 class AgentRunRecord(BaseModel):

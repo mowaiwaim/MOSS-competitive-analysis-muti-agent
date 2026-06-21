@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>AI 驱动的竞品分析 Agent 协作系统 - 新一版</title>
+    <title>MOSS多agent智能竞品分析系统——小莫</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v='__APP_VERSION__') }}">
     <script src="{{ url_for('static', filename='app.js', v='__APP_VERSION__') }}" defer></script>
   </head>
@@ -11,7 +11,7 @@
     <div class="app-shell">
       <aside class="history-sidebar">
         <div class="history-brand-row">
-          <button class="brand history-brand" id="homeButton" type="button">竞品分析Agent</button>
+          <button class="brand history-brand" id="homeButton" type="button">小莫</button>
           <button class="new-chat-button" id="newChatButton" type="button">开始新对话</button>
         </div>
         <div class="history-heading">
@@ -83,7 +83,7 @@
           <section id="boardView" class="view hidden">
         <div class="page-head">
           <div>
-            <p class="eyebrow">过程回放</p>
+            <p class="eyebrow">LangGraph 流程阶段图</p>
             <h1 id="taskTitle">任务看板</h1>
           </div>
           <div class="head-meta">
@@ -100,7 +100,7 @@
           <aside class="board-side-rail">
             <section class="inline-plan-card" id="inlinePlanCard">
               <div class="inline-plan-head">
-                <strong>任务执行计划</strong>
+                <strong>LangGraph 执行计划</strong>
                 <span id="inlinePlanSummary">等待开始</span>
               </div>
               <ol id="inlinePlanSteps"></ol>
@@ -256,7 +256,7 @@
           <span id="manualTextLabel">复查说明</span>
           <textarea id="manualTextInput" rows="5" required placeholder="例如：这个结论证据不够，请补充来源并重新质检"></textarea>
         </label>
-        <button class="primary" type="submit">提交</button>
+        <button class="primary" id="manualSubmitButton" type="submit">提交</button>
       </form>
     </div>
 

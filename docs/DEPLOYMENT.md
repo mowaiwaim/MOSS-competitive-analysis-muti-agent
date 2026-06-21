@@ -1,16 +1,16 @@
-# 第五版部署说明
+# MOSS多agent智能竞品分析系统——小莫部署说明
 
 ## 本地运行
 
 ```powershell
-cd "D:\ai驱动的竞品分析agent协作系统\competitive analysis\第五版"
+cd "path\to\MOSS-competitive-analysis"
 python app.py
 ```
 
 默认监听：
 
 ```text
-http://127.0.0.1:5007
+http://127.0.0.1:5016
 ```
 
 ## 环境变量
@@ -21,18 +21,31 @@ http://127.0.0.1:5007
 $env:FLASK_SECRET_KEY="replace-with-random-secret"
 ```
 
-豆包真实调用：
+深度分析模型调用顺序为 DeepSeek -> 智谱 -> 豆包。`REACT_AGENT_PROVIDER=auto` 会按此顺序尝试已配置的 provider；显式设置 `deepseek`、`zhipu` 或 `doubao` 时只使用该 provider。
 
 ```powershell
-$env:LLM_PROVIDER="doubao"
-$env:DOUBAO_API_KEY="your-api-key"
+$env:REACT_AGENT_PROVIDER="auto"
+$env:DEEPSEEK_API_KEY="your-deepseek-api-key"
+$env:DEEPSEEK_MODEL="deepseek-v4-pro"
+$env:ZHIPU_API_KEY="your-zhipu-api-key"
+$env:ZHIPU_MODEL="your-zhipu-model"
+$env:DOUBAO_API_KEY="your-doubao-api-key"
 $env:DOUBAO_ENDPOINT_ID="your-endpoint-id"
 $env:DOUBAO_MODEL_NAME="Doubao-Seed-2.0-lite"
 ```
 
-也可以在 `第五版/.env.local` 写入同名变量。本地文件已被 `.gitignore` 忽略，系统环境变量会覆盖 `.env.local`。
+也可以在项目根目录的 `.env.local` 写入同名变量。本地文件已被 `.gitignore` 忽略，系统环境变量会覆盖 `.env.local`。
 
-未设置 `LLM_PROVIDER` 时，如果存在 `DOUBAO_API_KEY` 会尝试豆包；否则使用 `mock` Provider。缺少接入点、网络失败或返回不符合 Schema 时会自动降级规则/模板流程。验证真实调用时，新建任务后查看日志：`model_provider=doubao` 且工具调用包含 `doubao_chat_completions` 才表示豆包参与了分析、质检或报告改写。
+常规结构化分析、搜索规划、问卷和访谈辅助仍可使用 `LLM_PROVIDER=doubao`；未配置时使用 `mock` Provider。顶层多 Agent 流程由 LangGraph StateGraph 编排，Orchestrator 承载节点业务逻辑。深度报告缺少模型 Key、网络失败或返回不符合 Schema 时会自动降级规则/模板流程。验证真实调用时，新建任务后查看日志中的 `workflow_engine=langgraph_stategraph`、`model_provider`、`preferred_order`、`deep_report_execution_mode` 和工具调用记录。
+
+主采集来源：
+
+```powershell
+$env:VOLC_SEARCH_API_KEY="your-volc-search-api-key"
+$env:GOOGLE_ALERTS_RSS_URL="your-google-alerts-rss-url"
+```
+
+火山联网搜索、Google Alerts RSS 和 AppArk 是报告主采集口径。ReAct 辅助工具中的 DuckDuckGo 搜索、旧 Bing 搜索类、requests 抓页和 Playwright 截图能力保留，用于深度报告补充和调试，不在本轮删除。
 
 飞书问卷发布：
 
@@ -47,9 +60,9 @@ $env:FEISHU_DEFAULT_FOLDER_TOKEN=""
 
 ## 数据库与文件
 
-- 数据库：`第五版/data/app.db`
-- 上传目录：`第五版/data/uploads/`
-- 样例数据：`第五版/data/demo_dataset.json`
+- 数据库：`data/app.db`
+- 上传目录：`data/uploads/`
+- 样例数据：`data/demo_dataset.json`
 - 问卷设计：`questionnaire_designs`
 - 问卷回答：`questionnaire_responses`
 - 问卷发布记录：`questionnaire_publish_targets`
@@ -58,10 +71,10 @@ $env:FEISHU_DEFAULT_FOLDER_TOKEN=""
 
 ## 演示建议
 
-- 主流程默认不联网搜索；网络不稳定时使用缓存样例或上传资料，保证稳定。
-- 现场证明真实能力时使用实时采集，并观察看板中的自动搜索状态和日志中的豆包调用状态。
+- 网络不稳定时使用缓存样例或上传资料，保证稳定。
+- 现场证明真实能力时使用实时采集，并观察看板中的自动搜索状态、来源目录和模型调用状态。
 - 演示用户研究能力时，先创建任务，再用右下角“用户调研”生成问卷链接；如需展示飞书链路，点击“生成飞书问卷”，打开返回的飞书链接。
-- 如需展示豆包调用，先在本机设置环境变量；不要把 Key 写入页面、截图、文档或命令历史展示材料。
+- 如需展示模型调用，先在本机设置环境变量；不要把 Key 写入页面、截图、文档或命令历史展示材料。
 
 ## 生产化待办
 

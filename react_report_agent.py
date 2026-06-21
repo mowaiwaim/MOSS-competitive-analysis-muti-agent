@@ -110,6 +110,7 @@ class ReactReportResult:
     provider: str
     markdown: str
     sections: list[dict[str, Any]]
+    execution_mode: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     screenshots: list[str] = field(default_factory=list)
     fallback_reason: str = ""
@@ -270,6 +271,8 @@ def _strict_provider_from_env() -> str:
     preferred = os.environ.get("REACT_AGENT_PROVIDER", "").strip().lower()
     if preferred in {"deepseek", "deepseek-react", "deepseek-v4-pro", "deepseek-v4-flash"}:
         return "deepseek-react"
+    if preferred in {"zhipu", "zhipu-react", "glm", "glm-react"}:
+        return "zhipu-react"
     if preferred in {"doubao", "doubao-react"}:
         return "doubao-react"
     return ""
@@ -293,6 +296,8 @@ def _provider_timeout_seconds(provider_name: str) -> int:
     fallback = _read_int_env("REACT_AGENT_MAX_SECONDS", 600)
     if provider_name == "deepseek-react":
         return _read_int_env("DEEPSEEK_REACT_MAX_SECONDS", 900, maximum=2400)
+    if provider_name == "zhipu-react":
+        return _read_int_env("ZHIPU_REACT_MAX_SECONDS", 600, maximum=1800)
     if provider_name == "doubao-react":
         return _read_int_env("DOUBAO_REACT_MAX_SECONDS", 450, maximum=1800)
     return fallback
@@ -328,6 +333,8 @@ def _configured_providers() -> list[dict[str, Any]]:
     preferred = os.environ.get("REACT_AGENT_PROVIDER", "").strip().lower()
     strict_provider = _strict_provider_from_env()
     deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    zhipu_key = os.environ.get("ZHIPU_API_KEY", "")
+    zhipu_model = os.environ.get("ZHIPU_MODEL", "")
     doubao_key = os.environ.get("DOUBAO_API_KEY", "")
     doubao_model = os.environ.get("DOUBAO_ENDPOINT_ID", "") or os.environ.get("DOUBAO_MODEL_NAME", "")
 
@@ -340,6 +347,13 @@ def _configured_providers() -> list[dict[str, Any]]:
         "extra_body": _provider_extra_body("deepseek-react"),
         "reasoning_effort": _provider_reasoning_effort("deepseek-react"),
     } if deepseek_key else None
+    zhipu_provider = {
+        "provider": "zhipu-react",
+        "api_key": zhipu_key,
+        "base_url": os.environ.get("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").rstrip("/"),
+        "model": zhipu_model,
+        "timeout_seconds": _provider_timeout_seconds("zhipu-react"),
+    } if zhipu_key and zhipu_model else None
     doubao_provider = {
         "provider": "doubao-react",
         "api_key": doubao_key,
@@ -350,11 +364,13 @@ def _configured_providers() -> list[dict[str, Any]]:
 
     if strict_provider == "deepseek-react":
         preferred_order = [deepseek_provider]
+    elif strict_provider == "zhipu-react":
+        preferred_order = [zhipu_provider]
     elif strict_provider == "doubao-react":
         preferred_order = [doubao_provider]
     else:
-        preferred_order = [doubao_provider, deepseek_provider] if preferred == "doubao" else [deepseek_provider, doubao_provider]
-    providers: list[dict[str, str]] = []
+        preferred_order = [deepseek_provider, zhipu_provider, doubao_provider]
+    providers: list[dict[str, Any]] = []
     for provider in preferred_order:
         if provider and provider["provider"] not in {item["provider"] for item in providers}:
             providers.append(provider)
@@ -384,6 +400,7 @@ def react_provider_status() -> dict[str, Any]:
         "react_timeout_seconds": {
             "default": _read_int_env("REACT_AGENT_MAX_SECONDS", 600),
             "deepseek-react": _provider_timeout_seconds("deepseek-react"),
+            "zhipu-react": _provider_timeout_seconds("zhipu-react"),
             "doubao-react": _provider_timeout_seconds("doubao-react"),
         },
         "last_success_provider": _LAST_PROVIDER_STATUS.get("last_success_provider", ""),
@@ -708,7 +725,7 @@ def _fallback_report(task: dict[str, Any], sources: list[dict[str, Any]], claims
 - **价格与商业化是高风险信息**：套餐、API 单价、折扣和权益经常变化，必须以官方价格页、销售材料或可信第三方页面为依据；未抓到明确来源时只能标注“待核实”。
 - **用户口碑需要交叉验证**：单一官网或营销页面只能说明厂商叙事，用户评价、社区反馈、应用商店评论和案例库才能支撑体验判断。
 - **系统 1 的可视化仍然有价值**：热力图、定位图、SWOT、决策矩阵和来源目录适合做管理层快速浏览；本章正文则承担系统 2 风格的深度解释。
-- **下一步应补强动态证据**：建议配置 DeepSeek Key，让 LangGraph ReAct Agent 继续搜索官网、价格页、评价、新闻和案例，形成更接近系统 2 输出的实时深度报告。
+- **下一步应补强动态证据**：建议配置 DeepSeek Key，让 DeepSeek direct thinking 优先生成高质量长报告；需要搜索、抓页或截图补证时，再由内层 StateGraph ReAct 工具循环执行。
 
 ## 二、市场与赛道分析（Market Context）
 ### 2.1 市场结构与增长逻辑
@@ -828,18 +845,20 @@ def _fallback_report(task: dict[str, Any], sources: list[dict[str, Any]], claims
 
 ### 11.2 测试方法
 - 系统 1：前端创建任务，Orchestrator 调度采集 Agent、分析 Agent、质检 Agent 和报告 Agent。
-- 系统 2 能力：配置模型 Key 后，LangGraph ReAct Agent 继续搜索、抓取网页和可选截图，并输出 11 章深度报告。
+- 系统 2 能力：配置模型 Key 后，分析 Agent 优先使用 DeepSeek direct thinking 输出 11 章深度报告；需要动态补证时使用内层 StateGraph ReAct 工具循环搜索、抓取网页和可选截图。
 - 证据策略：官网、价格页、文档、案例、应用商店、社区评价和新闻稿优先；搜索摘要只能作为线索。
 - 合规边界：所有关键事实必须回链来源；敏感信息和 API Key 不进入日志或报告正文。
 
 ### 11.3 信息不足说明
-本报告当前处于本地降级模式，深度结构已经按系统 2 报告组织，但未执行实时 ReAct 检索。填入 `.env` 中的 `DEEPSEEK_API_KEY` 后，系统会优先使用 DeepSeek 的 LangGraph ReAct Agent 生成更接近系统 2 输出密度的报告。
+本报告当前处于本地降级模式，深度结构已经按系统 2 报告组织，但未执行实时模型生成或 ReAct 检索。填入 `.env` 中的 `DEEPSEEK_API_KEY` 后，系统会优先使用 DeepSeek direct thinking 生成更接近系统 2 输出密度的报告。
 """
     return ReactReportResult(
         enabled=False,
         provider="local-react-fallback",
         markdown=markdown,
         sections=_parse_markdown_sections(markdown),
+        execution_mode="local_fallback",
+        tool_calls=[{"name": "deep_report_generation", "deep_report_execution_mode": "local_fallback", "result": f"fallback: {reason}"}],
         fallback_reason=reason,
         token_input=estimate_tokens(str(task) + str(sources) + str(claims)),
         token_output=estimate_tokens(markdown),
@@ -1010,7 +1029,12 @@ def run_react_report(
 
     providers = _configured_providers()
     if not providers:
-        return _fallback_report(task, sources, claims, "未配置 DEEPSEEK_API_KEY，或未配置 DOUBAO_API_KEY + DOUBAO_ENDPOINT_ID/DOUBAO_MODEL_NAME")
+        return _fallback_report(
+            task,
+            sources,
+            claims,
+            "未配置 DEEPSEEK_API_KEY，或未配置 ZHIPU_API_KEY + ZHIPU_MODEL，或未配置 DOUBAO_API_KEY + DOUBAO_ENDPOINT_ID/DOUBAO_MODEL_NAME",
+        )
 
     if _LANGGRAPH_IMPORT_ERROR is not None:
         return _fallback_report(task, sources, claims, f"LangGraph 依赖不可用：{safe_error(_LANGGRAPH_IMPORT_ERROR)}")
@@ -1073,13 +1097,15 @@ def run_react_report(
                 provider=provider["provider"],
                 markdown=final_report,
                 sections=_parse_markdown_sections(final_report),
+                execution_mode="deepseek_direct_thinking",
                 tool_calls=failover_calls
                 + failover_diagnostics
                 + tool_calls
                 + [
                     {
-                        "name": "langgraph_react_report",
+                        "name": "deep_report_generation",
                         "provider": provider["provider"],
+                        "deep_report_execution_mode": "deepseek_direct_thinking",
                         "timeout_seconds": max_seconds,
                         "result": f"{len(final_report)} chars",
                     }
@@ -1115,13 +1141,15 @@ def run_react_report(
                 provider=provider["provider"],
                 markdown=final_report,
                 sections=_parse_markdown_sections(final_report),
+                execution_mode="zhipu_direct_safe",
                 tool_calls=failover_calls
                 + failover_diagnostics
                 + tool_calls
                 + [
                     {
-                        "name": "langgraph_react_report",
+                        "name": "deep_report_generation",
                         "provider": provider["provider"],
+                        "deep_report_execution_mode": "zhipu_direct_safe",
                         "timeout_seconds": max_seconds,
                         "result": f"{len(final_report)} chars",
                     }
@@ -1218,13 +1246,15 @@ def run_react_report(
             provider=provider["provider"],
             markdown=final_report,
             sections=_parse_markdown_sections(final_report),
+            execution_mode="stategraph_react_tools",
             tool_calls=failover_calls
             + failover_diagnostics
             + tool_calls
             + [
                 {
-                    "name": "langgraph_react_report",
+                    "name": "deep_report_generation",
                     "provider": provider["provider"],
+                    "deep_report_execution_mode": "stategraph_react_tools",
                     "timeout_seconds": max_seconds,
                     "result": f"{len(final_report)} chars",
                 }

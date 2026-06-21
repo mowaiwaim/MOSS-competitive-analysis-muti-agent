@@ -144,21 +144,80 @@ def _build_pdf_source_ref_urls(content: dict[str, Any]) -> dict[str, str]:
     result: dict[str, str] = {}
     for source in content.get("source_catalog") or []:
         ref = str(source.get("ref") or "")
+        source_id = str(source.get("id") or "")
         url = str(source.get("url_or_path") or "")
         if ref and re.match(r"^https?://", url, flags=re.I):
             result[ref] = url
+            match = re.match(r"^S(\d+)$", ref, flags=re.I)
+            if match:
+                result[match.group(1)] = url
+                result[f"[{match.group(1)}]"] = url
+        if source_id and re.match(r"^https?://", url, flags=re.I):
+            result[source_id] = url
     return result
 
 
-def _source_refs_flow(refs: Sequence[str] | None, source_ref_urls: dict[str, str]) -> Paragraph:
+def _build_pdf_source_ref_labels(content: dict[str, Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for fallback, source in enumerate(content.get("source_catalog") or [], start=1):
+        if not isinstance(source, dict):
+            continue
+        ref = str(source.get("ref") or "")
+        source_id = str(source.get("id") or "")
+        label = _source_catalog_label(source, fallback)
+        for key in [ref, label, f"S{label}", f"[{label}]", source_id]:
+            cleaned = str(key or "").strip().strip("[]")
+            if cleaned:
+                result[cleaned] = label
+                result[f"[{cleaned}]"] = label
+    return result
+
+
+def _source_ref_label(ref: Any) -> str:
+    text = str(ref or "").strip().strip("[]")
+    match = re.match(r"^S(\d+)$", text, flags=re.I)
+    return match.group(1) if match else text
+
+
+def _is_pdf_internal_source_ref(ref: Any) -> bool:
+    return bool(re.match(r"^[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|input|url|src|source)[A-Za-z0-9_]*$", str(ref or "").strip().strip("[]"), flags=re.I))
+
+
+def _pdf_source_ref_markup(
+    ref: Any,
+    source_ref_urls: dict[str, str] | None,
+    source_ref_labels: dict[str, str] | None = None,
+    superscript: bool = False,
+) -> str:
+    raw_ref = str(ref or "").strip()
+    raw_key = raw_ref.strip("[]")
+    labels = source_ref_labels or {}
+    label = labels.get(raw_ref) or labels.get(raw_key) or _source_ref_label(ref)
+    if not label:
+        return ""
+    refs = source_ref_urls or {}
+    url = refs.get(raw_ref) or refs.get(raw_key) or refs.get(label) or refs.get(f"S{label}") or refs.get(f"[{label}]")
+    if _is_pdf_internal_source_ref(raw_key) and raw_key not in labels and not url:
+        return ""
+    safe_label = html.escape(label)
+    text = f"[{safe_label}]"
+    if superscript:
+        text = f"<super>{text}</super>"
+    if url:
+        return f'<a href="{html.escape(url, quote=True)}" color="#2563A7">{text}</a>'
+    return text
+
+
+def _source_refs_flow(
+    refs: Sequence[str] | None,
+    source_ref_urls: dict[str, str],
+    source_ref_labels: dict[str, str] | None = None,
+) -> Paragraph:
     parts: list[str] = []
     for ref in refs or []:
-        safe_ref = html.escape(str(ref))
-        url = source_ref_urls.get(str(ref))
-        if url:
-            parts.append(f'<a href="{html.escape(url, quote=True)}" color="#2563A7">{safe_ref}</a>')
-        else:
-            parts.append(safe_ref)
+        markup = _pdf_source_ref_markup(ref, source_ref_urls, source_ref_labels)
+        if markup:
+            parts.append(markup)
     return P_html(" ".join(parts) or "未列入正文依据", "TableCell")
 
 
@@ -556,6 +615,33 @@ def _is_evidence_style_link_label(value: str) -> bool:
     return "**" in raw or bool(re.search(r"(?:资料来源|参考来源|来源|出处)", raw)) or len(cleaned) > 36
 
 
+def _is_pdf_source_ref_token(value: Any) -> bool:
+    token = str(value or "").strip().strip("[]")
+    return bool(re.match(r"^(?:S?\d+|[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|input|url|src|source)[A-Za-z0-9_]*)$", token, flags=re.I))
+
+
+def _clean_pdf_source_ref_token(value: Any) -> str:
+    token = str(value or "").strip().strip("[]")
+    token = re.sub(r"^(?:资料来源|参考来源|来源|出处)\s*[:：]?\s*", "", token)
+    token = token.strip().strip("[]").strip()
+    token = re.sub(r"[，,。；;、.]+$", "", token).strip()
+    return token.strip("[]")
+
+
+def _has_pdf_source_cue(value: Any) -> bool:
+    return bool(re.search(r"(?:资料来源|参考来源|来源|出处)\s*[:：]?", str(value or "")))
+
+
+def _split_pdf_source_ref_tokens(value: Any) -> list[str]:
+    cleaned_value = re.sub(r"^(?:资料来源|参考来源|来源|出处)\s*[:：]?\s*", "", str(value or "").strip())
+    tokens = [
+        _clean_pdf_source_ref_token(part)
+        for part in re.split(r"\s*(?:[、,，/;；]|\band\b|和|及|-|–|—)\s*", cleaned_value)
+        if part.strip()
+    ]
+    return [token for token in tokens if _is_pdf_source_ref_token(token)]
+
+
 def _md_inline(
     text: Any,
     limit: int = 1800,
@@ -567,6 +653,8 @@ def _md_inline(
     original_text = raw_text
     markers: dict[str, str] = {}
     used_urls: set[str] = set()
+    source_ref_urls = _build_pdf_source_ref_urls({"source_catalog": source_catalog or []})
+    source_ref_labels = _build_pdf_source_ref_labels({"source_catalog": source_catalog or []})
 
     def make_marker(url_token: str) -> str:
         url, suffix = _split_url_token(url_token)
@@ -580,6 +668,30 @@ def _md_inline(
         markers[marker] = f'<a href="{safe_url}" color="#2563A7"><super>[{html.escape(label)}]</super></a>{html.escape(suffix)}'
         return marker
 
+    def make_source_ref_marker(ref_token: str) -> str:
+        marker = f"__PDF_CIT_{len(markers)}__"
+        raw_key = str(ref_token or "").strip().strip("[]")
+        url = source_ref_urls.get(str(ref_token)) or source_ref_urls.get(raw_key) or source_ref_urls.get(_source_ref_label(ref_token))
+        if url:
+            normalized = _normalize_reference_url(url)
+            if normalized:
+                used_urls.add(normalized)
+        markup = _pdf_source_ref_markup(ref_token, source_ref_urls, source_ref_labels, superscript=True)
+        markers[marker] = markup or ("" if _is_pdf_internal_source_ref(raw_key) else html.escape(str(ref_token or "")))
+        return marker
+
+    def replace_source_ref_bracket(match: re.Match[str]) -> str:
+        tokens = _split_pdf_source_ref_tokens(match.group(1))
+        if not tokens:
+            if _has_pdf_source_cue(match.group(1)):
+                return ""
+            return match.group(0)
+        return "".join(make_source_ref_marker(token) for token in tokens)
+
+    def replace_explicit_source_ref(match: re.Match[str]) -> str:
+        tokens = _split_pdf_source_ref_tokens(match.group(1))
+        return "".join(make_source_ref_marker(token) for token in tokens)
+
     raw_text = re.sub(
         r"\[([^\]]+)\]\((https?://[^)]+)\)",
         lambda match: f"{_clean_markdown_link_label(match.group(1)) if _is_evidence_style_link_label(match.group(1)) else match.group(1)} {make_marker(match.group(2))}",
@@ -590,7 +702,15 @@ def _md_inline(
         lambda match: make_marker(match.group(1)),
         raw_text,
     )
-    raw_text = re.sub(r"(__PDF_CIT_\d__)、+", r"\1 ", raw_text)
+    raw_text = re.sub(r"\[([^\]\n]{1,260})\]", replace_source_ref_bracket, raw_text)
+    source_ref_token = r"(?:[A-Za-z0-9]{4,}_(?:search|volc|ga|appark|rss|google|manual|input|url|src|source)[A-Za-z0-9_]*|S?\d+)"
+    raw_text = re.sub(
+        rf"(?:资料来源|参考来源|来源|出处)[:：]?\s*({source_ref_token}(?:\s*(?:[、,，/;；]|和|及|-|–|—)\s*{source_ref_token})*)(?:[，,。；;、.]*)",
+        replace_explicit_source_ref,
+        raw_text,
+        flags=re.I,
+    )
+    raw_text = re.sub(r"(__PDF_CIT_\d+)__、+", r"\1__ ", raw_text)
     escaped = _clean(raw_text, limit)
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
     escaped = re.sub(r"^([^<：:\n]{2,30})([：:])", r"<b>\1\2</b>", escaped)
@@ -893,6 +1013,7 @@ def _table(
     header_rows: int = 1,
     small: bool = True,
     url_refs: dict[str, str] | None = None,
+    source_catalog: Sequence[dict[str, Any]] | None = None,
 ) -> Table:
     converted = []
     for r, row in enumerate(rows):
@@ -901,7 +1022,14 @@ def _table(
             if isinstance(cell, Flowable):
                 converted_row.append(cell)
             else:
-                converted_row.append(P_md(cell, "TableHead" if r < header_rows else "TableCell", url_refs=url_refs))
+                converted_row.append(
+                    P_md(
+                        cell,
+                        "TableHead" if r < header_rows else "TableCell",
+                        url_refs=url_refs,
+                        source_catalog=source_catalog,
+                    )
+                )
         converted.append(converted_row)
     result = Table(converted, colWidths=widths, repeatRows=header_rows, hAlign="LEFT", splitByRow=1)
     result.setStyle(
@@ -949,13 +1077,14 @@ def _flush_md_table(
     flows: list[Flowable],
     table_rows: list[list[str]],
     url_refs: dict[str, str] | None = None,
+    source_catalog: Sequence[dict[str, Any]] | None = None,
 ) -> None:
     if not table_rows:
         return
     col_count = max(len(row) for row in table_rows)
     normalized = [row + [""] * (col_count - len(row)) for row in table_rows]
     widths = [CONTENT_W / col_count] * col_count
-    flows.append(_table(normalized[:18], widths, url_refs=url_refs))
+    flows.append(_table(normalized[:18], widths, url_refs=url_refs, source_catalog=source_catalog))
     table_rows.clear()
 
 
@@ -1002,7 +1131,7 @@ def markdown_to_pdf_flows(
         if not line:
             _flush_md_paragraph(flows, paragraph, url_refs=url_refs, source_catalog=source_catalog)
             _flush_md_bullet_table(flows, bullet_rows, url_refs=url_refs, source_catalog=source_catalog)
-            _flush_md_table(flows, table_rows, url_refs=url_refs)
+            _flush_md_table(flows, table_rows, url_refs=url_refs, source_catalog=source_catalog)
             continue
         table_cells = _md_table_row(line)
         if table_cells:
@@ -1012,13 +1141,13 @@ def markdown_to_pdf_flows(
                 continue
             table_rows.append(table_cells)
             continue
-        _flush_md_table(flows, table_rows, url_refs=url_refs)
+        _flush_md_table(flows, table_rows, url_refs=url_refs, source_catalog=source_catalog)
         heading = re.match(r"^(#{3,5})\s+(.+)$", line)
         if heading:
             _flush_md_paragraph(flows, paragraph, url_refs=url_refs, source_catalog=source_catalog)
             _flush_md_bullet_table(flows, bullet_rows, url_refs=url_refs, source_catalog=source_catalog)
             style = "H2" if len(heading.group(1)) <= 3 else "Small"
-            flows.append(P_md(heading.group(2), style, url_refs=url_refs))
+            flows.append(P_md(heading.group(2), style, url_refs=url_refs, source_catalog=source_catalog))
             continue
         bullet = re.match(r"^[-*]\s+(.+)$", line)
         if bullet:
@@ -1045,13 +1174,13 @@ def markdown_to_pdf_flows(
         if quote:
             _flush_md_paragraph(flows, paragraph, url_refs=url_refs, source_catalog=source_catalog)
             _flush_md_bullet_table(flows, bullet_rows, url_refs=url_refs, source_catalog=source_catalog)
-            flows.append(P_html(f"<font color='#5D6B7A'>{_md_inline(quote.group(1), 1000, url_refs=url_refs)}</font>", "Small"))
+            flows.append(P_html(f"<font color='#5D6B7A'>{_md_inline(quote.group(1), 1000, url_refs=url_refs, source_catalog=source_catalog)}</font>", "Small"))
             continue
         _flush_md_bullet_table(flows, bullet_rows, url_refs=url_refs, source_catalog=source_catalog)
         paragraph.append(line)
     _flush_md_paragraph(flows, paragraph, url_refs=url_refs, source_catalog=source_catalog)
     _flush_md_bullet_table(flows, bullet_rows, url_refs=url_refs, source_catalog=source_catalog)
-    _flush_md_table(flows, table_rows, url_refs=url_refs)
+    _flush_md_table(flows, table_rows, url_refs=url_refs, source_catalog=source_catalog)
     return flows or [P("暂无正文。")]
 
 
@@ -1185,6 +1314,7 @@ def render_competitive_report_pdf(task_id: str, report: dict[str, Any]) -> io.By
     app_market = content.get("app_market_data") or {}
     url_refs = _build_pdf_url_refs(content)
     source_ref_urls = _build_pdf_source_ref_urls(content)
+    source_ref_labels = _build_pdf_source_ref_labels(content)
 
     story.extend(
         [
@@ -1238,7 +1368,7 @@ def render_competitive_report_pdf(task_id: str, report: dict[str, Any]) -> io.By
                             f"{row.get('output_amount', '')} {row.get('currency', '')}",
                             row.get("cost_index", ""),
                             row.get("note", "") or row.get("basis", ""),
-                            _source_refs_flow(row.get("evidence_refs"), source_ref_urls),
+                            _source_refs_flow(row.get("evidence_refs"), source_ref_urls, source_ref_labels),
                         ]
                         for row in api_rows[:16]
                     ],
