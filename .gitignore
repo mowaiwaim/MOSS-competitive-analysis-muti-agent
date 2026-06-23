@@ -10,6 +10,7 @@
 data/
 output/
 uploads/
+tmp/
 *.db
 *.db-*
 *.sqlite
@@ -38,10 +39,9 @@ env/
 # Local-only reference material and copied helper packs
 测试资料/
 skills/
-启动_*.bat
-启动_*.ps1
-启动说明.md
-*版说明.md
+/启动_*.bat
+/启动_*.ps1
+/*说明.md
 
 # OS and editor files
 .DS_Store

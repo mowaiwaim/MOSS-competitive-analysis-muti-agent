@@ -42,8 +42,8 @@ from schema import TaskCreate, utc_now_iso
 
 
 BASE_DIR = Path(__file__).resolve().parent
-APP_VERSION = "20260620-manual-submit-2"
-DEFAULT_DB = BASE_DIR / "data" / "app.db"
+APP_VERSION = "20260622-start-ui-2"
+DEFAULT_DB = Path(os.environ.get("MOSS_DATABASE") or (BASE_DIR / "data" / "app.db"))
 DATASET_PATH = BASE_DIR / "data" / "demo_dataset.json"
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".pdf"}
@@ -2599,4 +2599,4 @@ app = create_app({"TESTING": True}) if "pytest" in sys.modules else create_app()
 
 if __name__ == "__main__":
     app = create_app()
-    app.run(host="127.0.0.1", port=5016, debug=False)
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5016")), debug=False)

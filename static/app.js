@@ -53,6 +53,17 @@ const focusAreaLabels = {
   "机会建议": "机会建议",
 };
 
+const defaultFocusAreas = [
+  "市场与赛道",
+  "竞品分层",
+  "核心能力",
+  "商业模式与定价",
+  "增长与分发",
+  "用户与场景",
+  "SWOT与壁垒",
+  "机会建议",
+];
+
 const $ = (selector) => document.querySelector(selector);
 const shanghaiFormatter = new Intl.DateTimeFormat("zh-CN", {
   timeZone: "Asia/Shanghai",
@@ -235,7 +246,10 @@ function formatDateTime(value) {
 }
 
 function getFocusAreas() {
-  return Array.from($("#focusOptions").querySelectorAll("input:checked")).map((input) => input.value);
+  const focusOptions = $("#focusOptions");
+  if (!focusOptions) return [...defaultFocusAreas];
+  const selected = Array.from(focusOptions.querySelectorAll("input:checked")).map((input) => input.value);
+  return selected.length ? selected : [...defaultFocusAreas];
 }
 
 function inferIndustryFromCompetitors(competitors, fallback = "") {
@@ -320,7 +334,7 @@ function updatePromptFeedback() {
   const parsed = parseTaskPrompt($("#taskPromptInput").value);
   feedback.classList.remove("error");
   if (!parsed.raw) {
-    feedback.textContent = "输入一句分析需求即可开始。";
+    feedback.textContent = "输入竞品名称即可开始";
     return;
   }
   if (!parsed.competitors.length) {

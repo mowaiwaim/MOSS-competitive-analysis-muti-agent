@@ -159,6 +159,10 @@ def test_index_copy_and_manual_modal_are_current(client):
     html = response.get_data(as_text=True)
     assert response.status_code == 200
     assert "MOSS多agent智能竞品分析系统——小莫" in html
+    assert "新分析任务" not in html
+    assert 'id="focusOptions"' not in html
+    assert 'class="brand-logo"' in html
+    assert ">MOSS</span>" in html
     assert "人工复查/补充材料" in html
     assert 'id="manualGuide"' in html
     assert 'id="manualTextLabel"' in html
@@ -1800,6 +1804,164 @@ def test_report_content_contains_target_report_structures(client):
     assert content["source_catalog"]
 
 
+def test_score_dimensions_are_fixed_eight_formula_rows(client):
+    task = create_demo_task(client)
+    report = client.get(f"/api/tasks/{task['id']}/report").get_json()
+    content = report["content"]
+    competitors = [item["name"] for item in client.get(f"/api/tasks/{task['id']}").get_json()["competitors"]]
+    expected_dimensions = [
+        "综合生产力",
+        "推理/代码",
+        "多模态与创意",
+        "企业治理",
+        "API 成本效率",
+        "开放/自部署",
+        "长上下文",
+        "生态集成",
+    ]
+
+    rows = content["score_dimensions"]
+    assert len(rows) == len(competitors) * len(expected_dimensions)
+    for competitor in competitors:
+        competitor_rows = [row for row in rows if row["competitor"] == competitor]
+        assert [row["dimension"] for row in competitor_rows] == expected_dimensions
+        assert all(row.get("formula_version") == "evidence_math_v1" for row in competitor_rows)
+        assert all(row.get("score_breakdown", {}).get("formula_version") == "evidence_math_v1" for row in competitor_rows)
+
+    radar = {row["competitor"]: row["scores"] for row in content["chart_data"]["radar"]}
+    for row in rows:
+        assert radar[row["competitor"]][row["dimension"]] == row["score"]
+
+
+def test_score_formula_uses_weighted_sources_and_claims(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    orchestrator = Orchestrator(tmp_path / "score-formula.db", ROOT / "data" / "demo_dataset.json")
+    sources = [
+        {
+            "id": "s1",
+            "source_type": "official_site",
+            "title": "ProductX 工作台 助手 自动化 协作",
+            "url_or_path": "https://productx.example/workspace",
+            "author_site": "productx.example",
+            "published_at": "",
+            "collected_at": "",
+            "credibility": "high",
+            "excerpt": "ProductX 是完整的一站式成熟工作台，覆盖广，支持任务执行。",
+            "related_claim_ids": "[]",
+            "competitor_name": "ProductX",
+            "module": "产品功能",
+            "relevance_score": 10,
+            "source_role": "official",
+            "raw_content_status": "fetched",
+        }
+    ]
+    claims = [
+        {
+            "section": "feature_tree",
+            "content": "ProductX 综合生产力强，工作台完整，一站式覆盖协作和任务执行。",
+            "confidence": 0.9,
+            "source_ids": ["s1"],
+            "needs_review": False,
+            "status": "reportable",
+        }
+    ]
+
+    rows = orchestrator._build_score_dimensions(["ProductX"], sources, claims, [], {})
+    row = next(item for item in rows if item["dimension"] == "综合生产力")
+
+    assert row["formula_version"] == "evidence_math_v1"
+    assert row["score"] == 3.2
+    assert row["score_breakdown"]["source_count"] == 1
+    assert row["score_breakdown"]["claim_count"] == 1
+    assert row["score_breakdown"]["positive_hits"] == 5
+    assert row["score_breakdown"]["evidence_score"] == 0.2125
+    assert row["score_breakdown"]["official_support"] == pytest.approx(0.5667, abs=0.0001)
+
+
+def test_api_cost_formula_uses_log_price_normalization(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    orchestrator = Orchestrator(tmp_path / "api-cost-formula.db", ROOT / "data" / "demo_dataset.json")
+    sources = [
+        {
+            "id": "s1",
+            "source_type": "pricing_page",
+            "title": "ExpensiveAI API pricing token price",
+            "url_or_path": "https://expensive.example/pricing",
+            "author_site": "expensive.example",
+            "published_at": "",
+            "collected_at": "",
+            "credibility": "high",
+            "excerpt": "ExpensiveAI API 输出价格 token 成本 定价。",
+            "related_claim_ids": "[]",
+            "competitor_name": "ExpensiveAI",
+            "module": "API 定价",
+            "relevance_score": 10,
+            "source_role": "official_pricing",
+            "raw_content_status": "fetched",
+        },
+        {
+            "id": "s2",
+            "source_type": "pricing_page",
+            "title": "CheapAI API pricing token price",
+            "url_or_path": "https://cheap.example/pricing",
+            "author_site": "cheap.example",
+            "published_at": "",
+            "collected_at": "",
+            "credibility": "high",
+            "excerpt": "CheapAI API 输出价格 token 成本 低价 定价。",
+            "related_claim_ids": "[]",
+            "competitor_name": "CheapAI",
+            "module": "API 定价",
+            "relevance_score": 10,
+            "source_role": "official_pricing",
+            "raw_content_status": "fetched",
+        },
+    ]
+    pricing = [
+        {"competitor": "ExpensiveAI", "output_amount": 10.0, "output_currency": "USD", "evidence_refs": ["[1]"]},
+        {"competitor": "CheapAI", "output_amount": 1.0, "output_currency": "USD", "evidence_refs": ["[2]"]},
+    ]
+
+    rows = orchestrator._build_score_dimensions(["ExpensiveAI", "CheapAI"], sources, [], pricing, {})
+    expensive = next(row for row in rows if row["competitor"] == "ExpensiveAI" and row["dimension"] == "API 成本效率")
+    cheap = next(row for row in rows if row["competitor"] == "CheapAI" and row["dimension"] == "API 成本效率")
+
+    assert expensive["score"] == 1.1
+    assert cheap["score"] == 4.5
+    assert expensive["score_breakdown"]["affordability"] == 0
+    assert cheap["score_breakdown"]["affordability"] == 1
+
+
+def test_long_context_formula_uses_token_window_signal(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    orchestrator = Orchestrator(tmp_path / "context-formula.db", ROOT / "data" / "demo_dataset.json")
+    base = {
+        "source_type": "official_doc",
+        "url_or_path": "https://example.com/context",
+        "author_site": "example.com",
+        "published_at": "",
+        "collected_at": "",
+        "credibility": "high",
+        "related_claim_ids": "[]",
+        "module": "上下文 文档",
+        "relevance_score": 10,
+        "source_role": "official_doc",
+        "raw_content_status": "fetched",
+    }
+    sources = [
+        {**base, "id": "s1", "competitor_name": "LongAI", "title": "LongAI context 1M token", "excerpt": "LongAI 支持 1M token 长上下文和长文档 RAG。"},
+        {**base, "id": "s2", "competitor_name": "ShortAI", "title": "ShortAI context 128K token", "excerpt": "ShortAI 支持 128K token 上下文。"},
+    ]
+
+    rows = orchestrator._build_score_dimensions(["LongAI", "ShortAI"], sources, [], [], {})
+    long_row = next(row for row in rows if row["competitor"] == "LongAI" and row["dimension"] == "长上下文")
+    short_row = next(row for row in rows if row["competitor"] == "ShortAI" and row["dimension"] == "长上下文")
+
+    assert long_row["score"] > short_row["score"]
+    assert long_row["score_breakdown"]["context_tokens"] == 1_000_000
+    assert short_row["score_breakdown"]["context_tokens"] == 128_000
+
+
 def test_report_dimensions_follow_industry_not_chat_ai_template(client):
     response = client.post(
         "/api/tasks",
@@ -1820,8 +1982,17 @@ def test_report_dimensions_follow_industry_not_chat_ai_template(client):
     assert profile["show_api_cost"] is False
     assert "车型" in profile["price_metric_label"]
     assert content["api_cost_data"]["enabled"] is False
-    assert not any(row["dimension"] == "API 成本效率" for row in content["score_dimensions"])
-    assert any(row["dimension"] == "三电/续航" for row in content["score_dimensions"])
+    assert {row["dimension"] for row in content["score_dimensions"]} == {
+        "综合生产力",
+        "推理/代码",
+        "多模态与创意",
+        "企业治理",
+        "API 成本效率",
+        "开放/自部署",
+        "长上下文",
+        "生态集成",
+    }
+    assert any(row["dimension"] == "三电/续航" for row in content["feature_scores"])
 
 
 def test_ai_dimension_profile_keeps_api_cost_for_chatgpt_deepseek(tmp_path, monkeypatch):
@@ -2157,7 +2328,9 @@ def test_react_deep_analysis_belongs_to_analysis_agent(client, monkeypatch):
     assert content["chart_data"]["radar"]
     for row in content["score_dimensions"]:
         assert row["rationale"]
-        assert row.get("evidence_refs") or row.get("section_refs") or row.get("status") == "NA"
+        breakdown = row.get("score_breakdown", {})
+        has_formula_basis = int(breakdown.get("source_count", 0) or 0) > 0 or int(breakdown.get("claim_count", 0) or 0) > 0
+        assert row.get("evidence_refs") or row.get("section_refs") or row.get("status") in {"NA", "价格证据不足"} or has_formula_basis
 
 
 def test_manual_source_refreshes_deep_analysis_before_report(client, monkeypatch):
@@ -2218,7 +2391,8 @@ def test_report_frontend_uses_linked_toc_and_app_market_visual_panel():
     assert "function parseMarkdownTableRow" in js
     assert "document.createElementNS" in js
     assert "豆包结构化" in js and "DeepSeek ReAct" in js
-    assert "市场与赛道" in html and "商业模式与定价" in html
+    assert 'id="focusOptions"' not in html
+    assert "市场与赛道" in js and "商业模式与定价" in js and "defaultFocusAreas" in js
     assert "href: `#${sectionAnchorId(index)}`" in js
     assert "buildRenderedReportItems" in js
     assert "可视化总览" in js

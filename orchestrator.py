@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import operator
 import os
 import re
@@ -3442,11 +3443,8 @@ class Orchestrator:
         sections = self._ensure_analysis_sections(guarded_sections, analysis_markdown)
 
         dimension_profile = self._build_dimension_profile(task, competitor_names)
-        source_catalog = self._build_source_catalog(sources)
         pricing_comparison = self._build_pricing_comparison(competitor_names, claims, sources, pricing_fact_rows, dimension_profile)
-        score_dimensions = self._build_score_dimensions(competitor_names, sources, pricing_comparison, dimension_profile)
-        if dimension_profile.get("show_api_cost"):
-            score_dimensions = self._apply_reference_ai_scores(competitor_names, score_dimensions, source_catalog, pricing_comparison)
+        score_dimensions = self._build_score_dimensions(competitor_names, sources, claims, pricing_comparison, dimension_profile)
         score_dimensions = self._calibrate_scores_from_analysis(score_dimensions, claims, sources, sections, analysis_markdown)
         radar_data = self._build_radar_chart_data(score_dimensions)
         artifact = {
@@ -3790,27 +3788,8 @@ class Orchestrator:
             section_refs = self._analysis_section_refs(item, sections, markdown)
             claim_refs = self._claim_refs_for_score(item, claims, ref_map)
             evidence_refs = list(dict.fromkeys((item.get("evidence_refs") or []) + claim_refs))
-            inferred_score = self._score_from_analysis_sections(item, sections, markdown)
-            if section_refs and evidence_refs and float(item.get("score") or 0) > 0:
-                item["score"] = min(5.0, round(float(item.get("score") or 0) + 0.2, 1))
-            if not evidence_refs:
-                if section_refs and inferred_score > 0:
-                    item["score"] = inferred_score
-                    item["status"] = "待确认"
-                    item["rationale"] = report_text(
-                        f"该评分基于深度分析章节 {', '.join(section_refs)} 的判断形成，但缺少可直接跳转的来源引用，已标为待确认。",
-                        240,
-                    )
-                else:
-                    item["score"] = 0
-                    item["status"] = "NA"
-                    item["rationale"] = "该评分缺少可追溯来源或章节依据，已按质检口径降为 NA。"
-            else:
-                item["status"] = item.get("status") or "分析判断"
-                if inferred_score > 0:
-                    item["score"] = max(float(item.get("score") or 0), inferred_score)
-                if section_refs:
-                    item["rationale"] = report_text(f"{item.get('rationale', '')}；已在深度分析章节 {', '.join(section_refs)} 中交叉出现。", 240)
+            if section_refs:
+                item["rationale"] = report_text(f"{item.get('rationale', '')}；深度分析章节 {', '.join(section_refs)} 中有对应讨论。", 240)
             item["evidence_refs"] = evidence_refs[:6]
             item["section_refs"] = section_refs
             calibrated.append(item)
@@ -6732,10 +6711,12 @@ class Orchestrator:
         feature_scores = self._build_feature_scores(competitor_names, sources, dimension_profile)
         pricing_comparison = self._build_pricing_comparison(competitor_names, claims, sources, pricing_facts, dimension_profile)
         pricing_fact_items = self._build_pricing_fact_items(pricing_facts, sources)
-        score_dimensions = self._build_score_dimensions(competitor_names, sources, pricing_comparison, dimension_profile)
-        if dimension_profile.get("show_api_cost"):
-            score_dimensions = self._apply_reference_ai_scores(competitor_names, score_dimensions, source_catalog, pricing_comparison)
-        if analysis_artifact and analysis_artifact.get("score_dimensions"):
+        score_dimensions = self._build_score_dimensions(competitor_names, sources, claims, pricing_comparison, dimension_profile)
+        if (
+            analysis_artifact
+            and analysis_artifact.get("score_dimensions")
+            and self._score_rows_use_current_formula(analysis_artifact.get("score_dimensions", []))
+        ):
             score_dimensions = analysis_artifact.get("score_dimensions", [])
         api_cost_data = self._build_api_cost_data(pricing_comparison, pricing_fact_items, dimension_profile)
         app_market_data = self._build_app_market_data(row_get(task, "id", ""), competitor_names)
@@ -6781,7 +6762,7 @@ class Orchestrator:
             "chart_data": {
                 "feature_heatmap": feature_scores,
                 "score_heatmap": score_dimensions,
-                "radar": (analysis_artifact or {}).get("radar_data") or self._build_radar_chart_data(score_dimensions),
+                "radar": self._build_radar_chart_data(score_dimensions),
                 "positioning_map": positioning_map,
                 "pricing_bars": pricing_comparison,
                 "api_cost_index": api_cost_data,
@@ -7358,12 +7339,19 @@ class Orchestrator:
         self,
         competitor_names: list[str],
         sources: list[sqlite3.Row],
+        claims: list[dict[str, Any] | sqlite3.Row],
         pricing_comparison: list[dict[str, Any]],
         dimension_profile: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        specs = self._dimension_specs(dimension_profile, "score_dimensions", "score")
+        specs = self._fixed_score_dimension_specs()
         ref_map = self._source_ref_map(sources)
         pricing_lookup = {row["competitor"].casefold(): row for row in pricing_comparison}
+        comparable_prices = self._comparable_api_prices(pricing_comparison)
+        context_tokens = {
+            name: self._best_context_tokens([source for source in sources if self._source_matches_competitor(source, name)])
+            for name in competitor_names
+        }
+        max_context_tokens = max([value for value in context_tokens.values() if value > 0] or [0])
         rows: list[dict[str, Any]] = []
         for name in competitor_names:
             related_sources = [source for source in sources if self._source_matches_competitor(source, name)]
@@ -7371,30 +7359,77 @@ class Orchestrator:
                 dimension = item.get("name", "")
                 description = item.get("description", "")
                 pattern = self._dimension_keyword_pattern(item)
-                if item.get("cost_dimension_kind") == "api_cost" or (dimension == "API 成本效率" and (dimension_profile or {}).get("show_api_cost", True)):
-                    rows.append(self._score_api_cost_dimension(name, description, pricing_lookup.get(name.casefold(), {})))
+                matched = self._score_dimension_sources(related_sources, pattern)
+                metric = self._score_evidence_metric(matched)
+                if item.get("cost_dimension_kind") == "api_cost":
+                    rows.append(
+                        self._score_api_cost_dimension(
+                            name,
+                            description,
+                            pricing_lookup.get(name.casefold(), {}),
+                            comparable_prices,
+                            metric,
+                        )
+                    )
                     continue
-                matched = [
-                    source
-                    for source in related_sources
-                    if re.search(pattern, f"{source['title']} {source['excerpt']} {row_get(source, 'module', '')} {row_get(source, 'source_role', '')}", flags=re.I)
-                ]
-                refs = self._source_refs_for_ids([source["id"] for source in matched[:4]], ref_map)
-                official_count = len([source for source in matched if row_get(source, "source_role", "") in {"official", "official_doc", "official_pricing"}])
-                fetched_count = len([source for source in matched if row_get(source, "raw_content_status", "") == "fetched"])
-                review_count = len([source for source in matched if row_get(source, "source_role", "") == "review"])
-                score = 0.0
-                if refs:
-                    score = min(5.0, 1.6 + official_count * 0.9 + fetched_count * 0.45 + review_count * 0.25 + min(len(matched), 5) * 0.22)
-                    if (dimension in {"开放/自部署", "长上下文"} or re.search(r"安全|合规|质量|财务|风险", dimension)) and not official_count:
-                        score = min(score, 3.2)
-                    score = round(max(1.0, score), 1)
-                status = "分析判断" if refs else "未评分"
-                rationale = (
-                    f"命中 {len(matched)} 条相关来源，其中官方/文档 {official_count} 条、正文抓取 {fetched_count} 条；评分为分析判断。"
-                    if refs
-                    else "该维度材料较少，暂不形成能力判断。"
+                related_claims, claim_metric = self._score_claim_support(name, item, claims)
+                text_metric = self._score_text_signal(item, matched, related_claims)
+                penalty = self._score_penalty(matched, related_claims)
+                if dimension == "长上下文":
+                    token_score = self._context_token_signal(context_tokens.get(name, 0), max_context_tokens)
+                    raw_score = 1 + 4 * (
+                        0.55 * token_score
+                        + 0.25 * metric["C"]
+                        + 0.10 * claim_metric["A"]
+                        + 0.10 * metric["O"]
+                    )
+                    breakdown_extra = {
+                        "context_tokens": context_tokens.get(name, 0),
+                        "max_context_tokens": max_context_tokens,
+                        "context_signal": round(token_score, 4),
+                    }
+                else:
+                    raw_score = 1 + 4 * (
+                        0.45 * text_metric["B"]
+                        + 0.25 * metric["C"]
+                        + 0.15 * claim_metric["A"]
+                        + 0.10 * metric["O"]
+                        + 0.05 * metric["U"]
+                    )
+                    breakdown_extra = {}
+                refs = self._source_refs_for_ids(
+                    [source["id"] for source in sorted(matched, key=self._source_weight, reverse=True)[:6]],
+                    ref_map,
                 )
+                if not matched and not related_claims:
+                    score = 0.0
+                    status = "NA"
+                    rationale = "该维度未命中可计算来源或绑定结论，按公式记为 NA。"
+                else:
+                    score = round(max(1.0, min(5.0, raw_score - penalty)), 1)
+                    status = "待复核" if penalty >= 0.35 or claim_metric["needs_review_ratio"] > 0 else "公式评分"
+                    rationale = (
+                        f"按 evidence_math_v1 计算：来源 {len(matched)} 条、结论 {len(related_claims)} 条，"
+                        f"C={metric['C']:.2f}、B={text_metric['B']:.2f}、A={claim_metric['A']:.2f}、"
+                        f"O={metric['O']:.2f}、U={metric['U']:.2f}、PEN={penalty:.2f}。"
+                    )
+                breakdown = {
+                    "formula_version": "evidence_math_v1",
+                    "evidence_score": round(metric["C"], 4),
+                    "domain_diversity": round(metric["U"], 4),
+                    "official_support": round(metric["O"], 4),
+                    "claim_support": round(claim_metric["A"], 4),
+                    "text_signal": round(text_metric["B"], 4),
+                    "penalty": round(penalty, 4),
+                    "source_count": len(matched),
+                    "claim_count": len(related_claims),
+                    "positive_hits": text_metric["positive_hits"],
+                    "negative_hits": text_metric["negative_hits"],
+                    "raw_score": round(raw_score, 4),
+                    "needs_review_ratio": round(claim_metric["needs_review_ratio"], 4),
+                    "low_quality_ratio": round(metric["low_quality_ratio"], 4),
+                }
+                breakdown.update(breakdown_extra)
                 rows.append(
                     {
                         "competitor": name,
@@ -7405,133 +7440,268 @@ class Orchestrator:
                         "status": status,
                         "rationale": report_text(rationale, 180),
                         "evidence_refs": refs,
+                        "formula_version": "evidence_math_v1",
+                        "score_breakdown": breakdown,
                     }
                 )
         return rows
 
-    def _apply_reference_ai_scores(
-        self,
-        competitor_names: list[str],
-        score_dimensions: list[dict[str, Any]],
-        source_catalog: list[dict[str, Any]],
-        pricing_comparison: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        normalized = {name.casefold(): name for name in competitor_names}
-        has_chatgpt = any(key in {"chatgpt", "openai"} or "chatgpt" in key for key in normalized)
-        has_deepseek = any("deepseek" in key for key in normalized)
-        if not (has_chatgpt and has_deepseek):
-            return score_dimensions
-
-        actual_name = {}
-        for key, name in normalized.items():
-            if key in {"chatgpt", "openai"} or "chatgpt" in key:
-                actual_name["chatgpt"] = name
-            if "deepseek" in key:
-                actual_name["deepseek"] = name
-
-        ref_by_competitor: dict[str, dict[str, list[str]]] = {}
-        for source in source_catalog:
-            comp = str(source.get("competitor", "")).casefold()
-            role = str(source.get("role", ""))
-            module = str(source.get("module", ""))
-            ref = str(source.get("ref", ""))
-            if not ref:
-                continue
-            key = "chatgpt" if "chatgpt" in comp or "openai" in comp else "deepseek" if "deepseek" in comp else ""
-            if not key:
-                continue
-            buckets = ref_by_competitor.setdefault(key, {"official": [], "pricing": [], "review": [], "security": [], "open": []})
-            if role in {"official", "official_doc"}:
-                buckets["official"].append(ref)
-            if role == "official_pricing" or "价格" in module or "API" in module:
-                buckets["pricing"].append(ref)
-            if role == "review" or "评价" in module:
-                buckets["review"].append(ref)
-            if "安全" in module or "企业" in module or "privacy" in str(source.get("title", "")).casefold():
-                buckets["security"].append(ref)
-            if "hugging" in str(source.get("url_or_path", "")).casefold() or "open" in str(source.get("title", "")).casefold():
-                buckets["open"].append(ref)
-
-        pricing_refs = {
-            row.get("competitor", "").casefold(): row.get("evidence_refs", [])
-            for row in pricing_comparison
-        }
-
-        profiles = {
-            "chatgpt": {
-                "综合生产力": (4.8, "官方产品和企业资料显示其工作台、文件、连接器、Agent 和多模态入口更完整。", "official"),
-                "推理/代码": (4.7, "模型、Codex/Agent 和开发者生态支撑复杂推理与代码工作流。", "official"),
-                "多模态与创意": (4.9, "图像、语音、视频和创意工具链的产品化证据更充分。", "official"),
-                "企业治理": (4.8, "Business/Enterprise、业务数据政策和企业控制项证据更完整。", "security"),
-                "API 成本效率": (2.2, "官方输出价作为高端基准，成本效率弱于 DeepSeek 低价 API。", "pricing"),
-                "开放/自部署": (1.4, "以闭源商业服务为主，自部署和开放权重不是核心交付方式。", "official"),
-                "长上下文": (3.4, "长上下文能力可用，但本轮官方证据相对 DeepSeek 1M 上下文更弱。", "official"),
-                "生态集成": (5.0, "连接器、企业管理、开发者平台和用户习惯形成更强生态。", "official"),
+    def _fixed_score_dimension_specs(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "综合生产力",
+                "description": "是否能覆盖日常办公、研究、文件、任务和协作等生产力场景。",
+                "keywords": ["工作台", "助手", "任务", "文档", "搜索", "企业版", "自动化", "效率", "协作", "productivity", "workspace"],
+                "positive_terms": ["完整", "一站式", "成熟", "覆盖广", "任务执行", "自动化", "协作", "高效"],
+                "negative_terms": ["单一", "缺少", "受限", "不可用", "割裂"],
             },
-            "deepseek": {
-                "综合生产力": (3.7, "免费聊天入口和文本/代码能力较强，但一站式工作台证据弱于 ChatGPT。", "official"),
-                "推理/代码": (4.4, "官方文档、API 兼容性和开发者口碑支撑推理与代码场景。", "official"),
-                "多模态与创意": (2.8, "公开证据主要集中在文本、推理、代码和 API，多模态产品化不足。", "official"),
-                "企业治理": (2.5, "隐私、数据地域和企业控制项仍需逐项采购审查。", "security"),
-                "API 成本效率": (5.0, "官方 API 输出价和缓存输入价显著低于高端基准。", "pricing"),
-                "开放/自部署": (5.0, "公开模型卡和开放权重/MIT 许可支撑自部署和替代供应商策略。", "open"),
-                "长上下文": (5.0, "官方文档显示 1M 上下文和高最大输出，适合长文档/RAG 场景。", "official"),
-                "生态集成": (3.3, "OpenAI/Anthropic 兼容接口降低迁移成本，但应用层连接器生态仍较弱。", "official"),
+            {
+                "name": "推理/代码",
+                "description": "复杂推理、代码生成、调试、数学和开发者工具能力。",
+                "keywords": ["推理", "代码", "编程", "开发者", "数学", "benchmark", "agent", "IDE", "API", "reasoning", "coding", "developer"],
+                "positive_terms": ["强推理", "代码能力", "复杂问题", "开发者生态", "调试", "数学", "benchmark"],
+                "negative_terms": ["幻觉", "错误", "质量下降", "不稳定", "失败"],
             },
-        }
-
-        dimensions = list(dict.fromkeys(row.get("dimension", "") for row in score_dimensions if row.get("dimension")))
-        description_by_dim = {row.get("dimension", ""): row.get("description", "") for row in score_dimensions}
-        rows: list[dict[str, Any]] = []
-        for key in ["chatgpt", "deepseek"]:
-            name = actual_name.get(key)
-            if not name:
-                continue
-            for dimension in dimensions:
-                score, rationale, ref_bucket = profiles[key].get(dimension, (0, "该维度缺少参考评分。", "official"))
-                bucket_refs = ref_by_competitor.get(key, {}).get(ref_bucket, [])
-                if ref_bucket == "pricing":
-                    bucket_refs = pricing_refs.get(name.casefold(), []) or bucket_refs
-                refs = list(dict.fromkeys(bucket_refs or ref_by_competitor.get(key, {}).get("official", [])))[:4]
-                rows.append(
-                    {
-                        "competitor": name,
-                        "dimension": dimension,
-                        "description": description_by_dim.get(dimension, ""),
-                        "score": score if refs else 0.0,
-                        "max_score": 5,
-                        "status": "分析判断" if refs else "未评分",
-                        "rationale": rationale if refs else "该维度材料较少，暂不输出参考评分。",
-                        "evidence_refs": refs,
-                    }
-                )
-        other_rows = [
-            row
-            for row in score_dimensions
-            if row.get("competitor") not in set(actual_name.values())
+            {
+                "name": "多模态与创意",
+                "description": "图像、语音、视频、文件上传、创作和设计能力。",
+                "keywords": ["图像", "语音", "视频", "文件上传", "创作", "设计", "多模态", "生成", "image", "voice", "video", "multimodal"],
+                "positive_terms": ["支持图像", "支持语音", "支持视频", "原生多模态", "创意工具", "生成"],
+                "negative_terms": ["仅文本", "能力缺失", "体验受限", "不支持"],
+            },
+            {
+                "name": "企业治理",
+                "description": "企业版、安全、隐私、权限、审计、合规和数据治理能力。",
+                "keywords": ["企业版", "SSO", "权限", "审计", "安全", "隐私", "合规", "数据隔离", "管理员", "SOC2", "ISO", "privacy", "security"],
+                "positive_terms": ["SOC2", "ISO", "SSO", "审计", "权限控制", "数据不训练", "合规", "安全"],
+                "negative_terms": ["隐私争议", "合规不足", "缺少权限", "数据风险", "泄露"],
+            },
+            {
+                "name": "API 成本效率",
+                "description": "官方输出价格归一化后的 API 成本优势。",
+                "keywords": ["API", "价格", "成本", "token", "低价", "定价", "pricing", "price"],
+                "positive_terms": ["低价", "便宜", "性价比", "缓存", "降价"],
+                "negative_terms": ["昂贵", "高价", "成本高", "收费"],
+                "cost_dimension_kind": "api_cost",
+            },
+            {
+                "name": "开放/自部署",
+                "description": "开源、开放权重、自部署、本地部署和私有化交付能力。",
+                "keywords": ["开源", "开放权重", "自部署", "本地部署", "MIT", "模型卡", "HuggingFace", "私有化", "open source", "self-host"],
+                "positive_terms": ["开源", "自部署", "MIT", "开放权重", "本地可用", "私有化"],
+                "negative_terms": ["闭源", "不可部署", "仅云服务", "授权限制"],
+            },
+            {
+                "name": "长上下文",
+                "description": "长文档、RAG 和大上下文窗口能力。",
+                "keywords": ["上下文", "context", "token", "长文档", "1M", "128K", "200K", "RAG", "long context"],
+                "positive_terms": ["长上下文", "长文档", "1M", "200K", "128K", "RAG"],
+                "negative_terms": ["上下文短", "限制", "截断", "不支持"],
+            },
+            {
+                "name": "生态集成",
+                "description": "插件、连接器、SDK、API 兼容、应用市场和第三方生态。",
+                "keywords": ["插件", "连接器", "应用市场", "API兼容", "SDK", "企业集成", "第三方", "生态", "工作流", "plugin", "connector", "integration"],
+                "positive_terms": ["连接器丰富", "插件生态", "SDK", "API兼容", "应用市场", "集成", "生态"],
+                "negative_terms": ["生态弱", "集成少", "封闭", "迁移成本高"],
+            },
         ]
-        return rows + other_rows
 
-    def _score_api_cost_dimension(self, competitor: str, description: str, pricing: dict[str, Any]) -> dict[str, Any]:
-        refs = pricing.get("evidence_refs", []) if pricing else []
-        output_amount = pricing.get("output_amount") if pricing else None
-        cost_index = pricing.get("cost_index") if pricing else None
-        if output_amount and cost_index is not None:
-            score = round(max(1.0, min(5.0, 5.2 - (float(cost_index) / 100.0) * 3.0)), 1)
-            rationale = f"官方输出价已归一为成本指数 {cost_index}；指数越低，API 成本效率得分越高。"
-            status = "分析判断"
-        elif output_amount:
-            score = 3.4
-            rationale = "已抽取官方输出价，但缺少可比基准；暂按中性偏高处理。"
-            status = "分析判断"
-        elif refs:
-            score = 2.4
-            rationale = "已定位官方价格/API来源，但未抽取到可计算金额。"
-            status = "待复核"
+    def _score_rows_use_current_formula(self, rows: list[dict[str, Any]]) -> bool:
+        return bool(rows) and all(
+            isinstance(row, dict)
+            and (
+                row.get("formula_version") == "evidence_math_v1"
+                or (isinstance(row.get("score_breakdown"), dict) and row["score_breakdown"].get("formula_version") == "evidence_math_v1")
+            )
+            for row in rows
+        )
+
+    def _score_dimension_sources(self, sources: list[sqlite3.Row], pattern: str) -> list[sqlite3.Row]:
+        factual = [source for source in sources if source["source_type"] not in {"manual_scope", "demo_scope_note"}]
+        return [
+            source
+            for source in factual
+            if re.search(
+                pattern,
+                f"{source['title']} {source['excerpt']} {row_get(source, 'module', '')} {row_get(source, 'source_role', '')} {source['url_or_path']}",
+                flags=re.I,
+            )
+        ]
+
+    def _score_evidence_metric(self, sources: list[sqlite3.Row]) -> dict[str, float]:
+        weights = sorted([self._source_weight(source) for source in sources], reverse=True)
+        c_score = min(1.0, sum(weights[:8]) / 4.0)
+        domains = {self._source_domain(source) for source in sources if self._source_domain(source)}
+        u_score = min(1.0, len(domains) / 3.0)
+        official_weight = sum(self._source_weight(source) for source in sources if self._is_official_score_source(source))
+        o_score = min(1.0, official_weight / 1.5)
+        low_quality = len(
+            [
+                source
+                for source in sources
+                if source["credibility"] == "low" or row_get(source, "raw_content_status", "") != "fetched"
+            ]
+        )
+        low_quality_ratio = low_quality / max(len(sources), 1)
+        return {"C": c_score, "U": u_score, "O": o_score, "low_quality_ratio": low_quality_ratio, "source_count": len(sources)}
+
+    def _source_weight(self, source: sqlite3.Row) -> float:
+        role = str(row_get(source, "source_role", "") or source["source_type"] or "").casefold()
+        source_type = str(source["source_type"] or "").casefold()
+        role_key = role or source_type
+        if role_key in {"official", "official_doc", "official_pricing", "manual_confirmation"}:
+            role_w = 1.0
+        elif role_key in {"appark", "app_market", "public_dataset"} or source_type in {"app_market", "appark"}:
+            role_w = 0.90
+        elif role_key in {"manual_url", "uploaded_file", "user_url"} or source_type in {"manual_url", "uploaded_file"}:
+            role_w = 0.85
+        elif role_key == "review" or source_type in {"review", "app_review"}:
+            role_w = 0.70
+        elif role_key in {"volc_search_result", "google_alert", "search_result", "web_page", "third_party", "news"} or source_type in {"volc_search_result", "search_result", "web_page"}:
+            role_w = 0.60
         else:
+            role_w = 0.45
+        credibility_w = {"high": 1.0, "medium": 0.75, "low": 0.45}.get(str(source["credibility"] or "").casefold(), 0.60)
+        content_w = {"fetched": 1.0, "summary_only": 0.65}.get(str(row_get(source, "raw_content_status", "") or "").casefold(), 0.35)
+        try:
+            relevance = float(row_get(source, "relevance_score", 0) or 0)
+            relevance_w = max(0.4, min(1.0, relevance / 10.0)) if relevance else 0.75
+        except (TypeError, ValueError):
+            relevance_w = 0.75
+        return role_w * credibility_w * content_w * relevance_w * self._source_recency_weight(source)
+
+    def _source_recency_weight(self, source: sqlite3.Row) -> float:
+        value = row_get(source, "published_at", "") or row_get(source, "collected_at", "")
+        if not value:
+            return 0.85
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age_days = max(0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).days)
+            return max(0.70, 1 - min(age_days, 1825) / 1825 * 0.30)
+        except Exception:
+            return 0.85
+
+    def _source_domain(self, source: sqlite3.Row) -> str:
+        parsed = urllib.parse.urlparse(str(source["url_or_path"] or ""))
+        return (parsed.netloc or str(source["author_site"] or "")).casefold()
+
+    def _is_official_score_source(self, source: sqlite3.Row) -> bool:
+        return str(row_get(source, "source_role", "") or "").casefold() in {"official", "official_doc", "official_pricing", "manual_confirmation"}
+
+    def _score_claim_support(
+        self,
+        competitor: str,
+        dimension_item: dict[str, Any],
+        claims: list[dict[str, Any] | sqlite3.Row],
+    ) -> tuple[list[dict[str, Any] | sqlite3.Row], dict[str, float]]:
+        related = [
+            claim
+            for claim in claims
+            if self._claim_matches_score_dimension(claim, competitor, dimension_item)
+        ]
+        support_scores = []
+        needs_review = 0
+        for claim in related:
+            source_ids = self._claim_source_ids(claim)
+            if not source_ids:
+                continue
+            try:
+                confidence = float(row_get(claim, "confidence", 0) or 0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            review_flag = bool(row_get(claim, "needs_review", False))
+            if review_flag:
+                needs_review += 1
+            binding_quality = min(1.0, len(source_ids) / 2.0)
+            support_scores.append(confidence * (1 - 0.35 * int(review_flag)) * binding_quality)
+        a_score = min(1.0, sum(sorted(support_scores, reverse=True)[:5]) / 3.0)
+        needs_review_ratio = needs_review / max(len(related), 1)
+        return related, {"A": a_score, "needs_review_ratio": needs_review_ratio}
+
+    def _claim_matches_score_dimension(self, claim: dict[str, Any] | sqlite3.Row, competitor: str, dimension_item: dict[str, Any]) -> bool:
+        content = str(row_get(claim, "content", "") or "")
+        if competitor and competitor.casefold() not in content.casefold():
+            return False
+        haystack = f"{content} {row_get(claim, 'section', '')} {row_get(claim, 'claim_type', '')}"
+        terms = [str(term) for term in dimension_item.get("keywords", []) if str(term)]
+        terms.extend([str(dimension_item.get("name", ""))])
+        return any(term and re.search(re.escape(term), haystack, flags=re.I) for term in terms)
+
+    def _claim_source_ids(self, claim: dict[str, Any] | sqlite3.Row) -> list[str]:
+        value = row_get(claim, "source_ids", [])
+        if isinstance(value, str):
+            return loads(value, [])
+        if isinstance(value, list):
+            return value
+        return []
+
+    def _score_text_signal(
+        self,
+        dimension_item: dict[str, Any],
+        sources: list[sqlite3.Row],
+        claims: list[dict[str, Any] | sqlite3.Row],
+    ) -> dict[str, float | int]:
+        text = " ".join(
+            [f"{source['title']} {source['excerpt']} {row_get(source, 'module', '')}" for source in sources]
+            + [str(row_get(claim, "content", "")) for claim in claims]
+        )
+        positive_terms = list(dict.fromkeys(dimension_item.get("positive_terms", []) or []))
+        negative_terms = list(dict.fromkeys(dimension_item.get("negative_terms", []) or []))
+        positive = min(5, sum(1 for term in positive_terms if term and re.search(re.escape(str(term)), text, flags=re.I)))
+        negative = min(4, sum(1 for term in negative_terms if term and re.search(re.escape(str(term)), text, flags=re.I)))
+        signal = max(0.20, min(1.0, 0.55 + 0.07 * positive - 0.10 * negative))
+        return {"B": signal, "positive_hits": positive, "negative_hits": negative}
+
+    def _score_penalty(self, sources: list[sqlite3.Row], claims: list[dict[str, Any] | sqlite3.Row]) -> float:
+        low_quality_ratio = self._score_evidence_metric(sources)["low_quality_ratio"]
+        review_count = len([claim for claim in claims if bool(row_get(claim, "needs_review", False))])
+        needs_review_ratio = review_count / max(len(claims), 1)
+        return min(0.70, 0.35 * needs_review_ratio + 0.25 * low_quality_ratio)
+
+    def _comparable_api_prices(self, pricing_comparison: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in pricing_comparison:
+            if row.get("output_amount") and row.get("output_currency"):
+                groups.setdefault(str(row.get("output_currency", "")).casefold(), []).append(row)
+        return max(groups.values(), key=len) if groups else []
+
+    def _score_api_cost_dimension(
+        self,
+        competitor: str,
+        description: str,
+        pricing: dict[str, Any],
+        comparable_prices: list[dict[str, Any]] | None = None,
+        evidence_metric: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        refs = pricing.get("evidence_refs", []) if pricing else []
+        metric = evidence_metric or {"C": 0.0}
+        price_rows = comparable_prices or []
+        price_by_competitor = {
+            str(row.get("competitor", "")).casefold(): float(row.get("output_amount") or 0)
+            for row in price_rows
+            if row.get("output_amount")
+        }
+        price = price_by_competitor.get(competitor.casefold())
+        if len(price_by_competitor) < 2 or price is None:
             score = 0.0
-            rationale = "官方价格/API材料较少，暂不评分。"
-            status = "未评分"
+            status = "价格证据不足"
+            rationale = "缺少至少两个同币种、同单位的官方输出价格，API 成本效率按公式记为 NA。"
+            affordability = 0.0
+        else:
+            p_min = min(price_by_competitor.values())
+            p_max = max(price_by_competitor.values())
+            if p_max <= 0 or p_min <= 0 or math.isclose(p_max, p_min):
+                affordability = 0.5
+            else:
+                affordability = (math.log(p_max) - math.log(max(price, 1e-9))) / (math.log(p_max) - math.log(p_min))
+                affordability = max(0.0, min(1.0, affordability))
+            raw_score = 1 + 4 * (0.85 * affordability + 0.15 * float(metric.get("C", 0.0)))
+            score = round(max(1.0, min(5.0, raw_score)), 1)
+            status = "公式评分"
+            rationale = f"按官方输出价对数归一计算：affordability={affordability:.2f}，证据覆盖 C={float(metric.get('C', 0.0)):.2f}。"
         return {
             "competitor": competitor,
             "dimension": "API 成本效率",
@@ -7541,7 +7711,54 @@ class Orchestrator:
             "status": status,
             "rationale": report_text(rationale, 180),
             "evidence_refs": refs,
+            "formula_version": "evidence_math_v1",
+            "score_breakdown": {
+                "formula_version": "evidence_math_v1",
+                "affordability": round(affordability, 4),
+                "evidence_score": round(float(metric.get("C", 0.0)), 4),
+                "source_count": int(metric.get("source_count", 0) or 0),
+                "price_count": len(price_by_competitor),
+                "output_amount": price,
+                "raw_score": score,
+            },
         }
+
+    def _best_context_tokens(self, sources: list[sqlite3.Row]) -> int:
+        best = 0
+        for source in sources:
+            text = f"{source['title']} {source['excerpt']} {row_get(source, 'module', '')}"
+            best = max(best, self._extract_context_tokens(text))
+        return best
+
+    def _extract_context_tokens(self, text: str) -> int:
+        best = 0
+        patterns = [
+            r"(\d+(?:\.\d+)?)\s*(百万|million|m|M)\s*(?:tokens?|token|上下文|context)?",
+            r"(\d+(?:\.\d+)?)\s*(万|k|K|千)\s*(?:tokens?|token|上下文|context)",
+            r"(?:上下文|context)[^\d]{0,16}(\d+(?:\.\d+)?)\s*(百万|million|m|M|万|k|K|千|tokens?|token)?",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.I):
+                amount = float(match.group(1))
+                unit = (match.group(2) or "token").casefold()
+                if unit in {"m", "million", "百万"}:
+                    value = int(amount * 1_000_000)
+                elif unit == "万":
+                    value = int(amount * 10_000)
+                elif unit in {"k", "千"}:
+                    value = int(amount * 1_000)
+                else:
+                    value = int(amount)
+                if value >= 1_000:
+                    best = max(best, value)
+        return best
+
+    def _context_token_signal(self, context_tokens: int, max_context_tokens: int) -> float:
+        if context_tokens <= 0 or max_context_tokens <= 1:
+            return 0.0
+        if math.isclose(float(context_tokens), float(max_context_tokens)):
+            return 1.0
+        return max(0.0, min(1.0, math.log(context_tokens) / math.log(max_context_tokens)))
 
     def _build_api_cost_data(
         self,

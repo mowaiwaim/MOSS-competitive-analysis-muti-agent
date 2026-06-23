@@ -11,7 +11,10 @@
     <div class="app-shell">
       <aside class="history-sidebar">
         <div class="history-brand-row">
-          <button class="brand history-brand" id="homeButton" type="button">小莫</button>
+          <button class="brand history-brand" id="homeButton" type="button" aria-label="MOSS 首页">
+            <img class="brand-logo" src="{{ url_for('static', filename='moss-logo.png', v='__APP_VERSION__') }}" alt="" aria-hidden="true">
+            <span>MOSS</span>
+          </button>
           <button class="new-chat-button" id="newChatButton" type="button">开始新对话</button>
         </div>
         <div class="history-heading">
@@ -41,7 +44,6 @@
           <section id="createView" class="view create-view">
             <form id="taskForm" class="create-panel chat-create-panel">
               <div class="panel-heading chat-heading">
-                <p class="eyebrow">新分析任务</p>
                 <h1>Hi~今天想分析点什么？</h1>
               </div>
 
@@ -60,21 +62,9 @@
 
               <div class="composer-meta">
                 <span class="source-status" id="sourceModeStatus">数据来源：缓存样例</span>
-                <span class="input-feedback" id="inputFeedback">默认不联网搜索，可通过 + 上传材料或手动开启联网搜索。</span>
+                <span class="input-feedback" id="inputFeedback">输入竞品名称即可开始</span>
               </div>
               <div class="upload-chips hidden" id="uploadChips" aria-label="已选上传材料"></div>
-
-              <fieldset class="focus-options focus-checks" id="focusOptions">
-                <legend>分析维度</legend>
-                <label><input type="checkbox" value="市场与赛道" checked> 市场与赛道</label>
-                <label><input type="checkbox" value="竞品分层" checked> 竞品分层</label>
-                <label><input type="checkbox" value="核心能力" checked> 核心能力</label>
-                <label><input type="checkbox" value="商业模式与定价" checked> 商业模式与定价</label>
-                <label><input type="checkbox" value="增长与分发" checked> 增长与分发</label>
-                <label><input type="checkbox" value="用户与场景" checked> 用户与场景</label>
-                <label><input type="checkbox" value="SWOT与壁垒" checked> SWOT 与壁垒</label>
-                <label><input type="checkbox" value="机会建议" checked> 机会建议</label>
-              </fieldset>
 
               <input class="visually-hidden" id="uploadInput" type="file" accept=".txt,.md,.csv,.json,.pdf" multiple>
             </form>

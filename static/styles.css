@@ -98,13 +98,24 @@ a {
 }
 
 .history-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
   min-width: 0;
   padding: 0;
-  font-size: 20px;
-  font-weight: 600;
+  font-size: 21px;
+  font-weight: 700;
   text-align: left;
   background: transparent;
   color: var(--charcoal);
+}
+
+.brand-logo {
+  display: block;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  object-fit: contain;
 }
 
 .new-chat-button {
@@ -299,18 +310,24 @@ a {
 }
 
 .create-panel {
-  width: min(860px, 100%);
+  width: min(920px, 100%);
   padding: 30px;
   border: 0;
   background: transparent;
 }
 
 .panel-heading {
-  margin-bottom: 22px;
+  margin-bottom: 26px;
 }
 
 .chat-heading {
   text-align: center;
+}
+
+.chat-heading h1 {
+  font-size: clamp(34px, 4.2vw, 48px);
+  line-height: 1.12;
+  font-weight: 700;
 }
 
 .eyebrow {
@@ -373,13 +390,14 @@ textarea {
 }
 
 #taskPromptInput {
-  min-height: 52px;
+  min-height: 58px;
   max-height: 130px;
   resize: none;
   border: 0;
   border-radius: 0;
-  padding: 14px 6px;
+  padding: 15px 6px;
   background: transparent;
+  font-size: 16px;
   line-height: 1.55;
 }
 
@@ -445,10 +463,10 @@ select:focus,
 .chat-composer {
   position: relative;
   display: grid;
-  grid-template-columns: 42px minmax(0, 1fr) auto;
+  grid-template-columns: 46px minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
-  padding: 8px;
+  padding: 9px;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--cream);
@@ -461,8 +479,8 @@ select:focus,
 .add-source-button {
   display: grid;
   place-items: center;
-  width: 42px;
-  height: 42px;
+  width: 46px;
+  height: 46px;
   border: 1px solid var(--border);
   border-radius: 9999px;
   background: var(--surface-subtle);
@@ -509,7 +527,9 @@ select:focus,
 }
 
 .send-button {
-  height: 42px;
+  height: 46px;
+  padding-inline: 20px;
+  font-size: 16px;
 }
 
 .composer-meta {
@@ -517,10 +537,17 @@ select:focus,
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
   margin-top: 12px;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.5;
+  text-align: left;
+}
+
+.input-feedback {
+  margin-left: auto;
+  text-align: right;
 }
 
 .source-status {
@@ -3073,7 +3100,7 @@ th {
   }
 }
 
-/* ── 新二版黑金主题覆盖 ── */
+/* MOSS 小莫黑金主题覆盖 */
 
 html {
   background: var(--onyx);
@@ -3669,7 +3696,7 @@ td {
 
   .chat-heading h1 {
     max-width: 100%;
-    font-size: 28px;
+    font-size: 34px;
     line-height: 1.14;
     overflow-wrap: anywhere;
     word-break: break-word;
