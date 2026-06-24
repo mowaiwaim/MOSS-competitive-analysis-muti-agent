@@ -859,9 +859,27 @@ select:focus,
 .node-events {
   display: grid;
   gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   margin: 0;
-  padding: 0;
+  padding: 0 6px 0 0;
   list-style: none;
+}
+
+.node-events::-webkit-scrollbar {
+  width: 8px;
+}
+
+.node-events::-webkit-scrollbar-track {
+  background: rgba(28, 28, 28, 0.08);
+  border-radius: 9999px;
+}
+
+.node-events::-webkit-scrollbar-thumb {
+  background: rgba(124, 91, 34, 0.45);
+  border-radius: 9999px;
 }
 
 .node-events li {
@@ -1933,6 +1951,28 @@ th .source-citation a:hover {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0 8px;
   padding: 0 8px;
+}
+
+.log-token-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 8px 16px 12px;
+}
+
+.log-token-summary span {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--cream);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  padding: 8px 10px;
+}
+
+.log-token-summary strong {
+  color: var(--charcoal);
+  font-size: 15px;
 }
 
 .floating-plan ol {

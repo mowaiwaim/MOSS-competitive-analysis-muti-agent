@@ -56,6 +56,7 @@ except Exception as exc:
     _WORKFLOW_LANGGRAPH_IMPORT_ERROR = exc
 
 WORKFLOW_ENGINE = "langgraph_stategraph"
+QA_AUTO_REWORK_MAX_ROUNDS = 3
 
 if _WORKFLOW_LANGGRAPH_IMPORT_ERROR is None:
     class WorkflowGraphState(TypedDict, total=False):
@@ -172,7 +173,7 @@ def sanitize_markdown_text(value: str, limit: int = 120000) -> str:
     cleaned = str(value or "").replace("\x00", " ")
     for pattern, replacement in SENSITIVE_PATTERNS:
         cleaned = pattern.sub(replacement, cleaned)
-    cleaned = cleaned.replace("竞争情报分析师", "MOSS团队")
+    cleaned = cleaned.replace("竞争情报分析师", "MOSS团队小莫")
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = re.sub(r"[ \t\f\v]+", " ", cleaned)
     cleaned = re.sub(r"\s+(#{2,5}\s+)", r"\n\n\1", cleaned)
@@ -235,7 +236,7 @@ def _norm_name(value: str) -> str:
 
 
 def report_text(value: str, limit: int = 360) -> str:
-    cleaned = sanitize_text(value, limit * 2).replace("竞争情报分析师", "MOSS团队")
+    cleaned = sanitize_text(value, limit * 2).replace("竞争情报分析师", "MOSS团队小莫")
     for pattern in REPORT_NOISE_PATTERNS:
         cleaned = pattern.sub("", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ：:;；，,。")
@@ -460,7 +461,7 @@ class Orchestrator:
         graph = self._build_initial_workflow_graph()
         final_state = graph.invoke(
             {"task_id": task_id, "workflow_trace": []},
-            config={"recursion_limit": 24},
+            config={"recursion_limit": 32},
         )
         trace = list(final_state.get("workflow_trace", []))
         self._log_agent_run(
@@ -538,7 +539,7 @@ class Orchestrator:
         last_failure_signature = ""
         repeated_failure_count = 0
         deep_refresh_needed = False
-        for qa_round in range(3):
+        for qa_round in range(QA_AUTO_REWORK_MAX_ROUNDS):
             self._ensure_not_stopped(task_id)
             rejected_claim_id = self._qa_check(task_id, first_pass=(qa_round == 0), rework_round=qa_round)
             self._ensure_not_stopped(task_id)
@@ -553,9 +554,13 @@ class Orchestrator:
             if repeated_failure_count >= 3:
                 self._handoff_open_findings_to_manual_review(task_id, repeated_failure_count, qa_round, failure_signature)
                 break
-            self._auto_repair_open_findings(task_id, qa_round + 1)
+            if qa_round + 1 >= QA_AUTO_REWORK_MAX_ROUNDS:
+                self._handoff_open_findings_to_manual_review(task_id, repeated_failure_count, qa_round, failure_signature)
+                break
+            repaired_count = self._auto_repair_open_findings(task_id, qa_round + 1)
             self._ensure_not_stopped(task_id)
-            self._repair_analysis(task_id, rejected_claim_id, source_map)
+            if repaired_count == 0:
+                self._repair_analysis(task_id, rejected_claim_id, source_map)
             deep_refresh_needed = self._analysis_artifact_needs_refresh(task_id)
         if deep_refresh_needed:
             self._ensure_not_stopped(task_id)
@@ -676,6 +681,39 @@ class Orchestrator:
                     )
                 ],
             }
+        if qa_round + 1 >= QA_AUTO_REWORK_MAX_ROUNDS:
+            self._log_workflow_node_event(
+                task_id,
+                "qa_review",
+                "finished",
+                f"自动质检已达到 {QA_AUTO_REWORK_MAX_ROUNDS} 轮上限，转入 manual_pending 交接节点，首版报告继续生成。",
+                severity="warning",
+                meta={
+                    "claim_id": rejected_claim_id,
+                    "failure_signature": failure_signature,
+                    "repeated_failure_count": repeated_failure_count,
+                    "qa_round": qa_round,
+                    "max_auto_qa_rounds": QA_AUTO_REWORK_MAX_ROUNDS,
+                },
+            )
+            return {
+                "rejected_claim_id": rejected_claim_id,
+                "last_failure_signature": failure_signature,
+                "repeated_failure_count": repeated_failure_count,
+                "next_node": "manual_handoff",
+                "workflow_trace": [
+                    self._workflow_trace_record(
+                        "qa_review",
+                        "manual_handoff_max_rounds",
+                        {
+                            "qa_round": qa_round,
+                            "claim_id": rejected_claim_id,
+                            "repeated_failure_count": repeated_failure_count,
+                            "max_auto_qa_rounds": QA_AUTO_REWORK_MAX_ROUNDS,
+                        },
+                    )
+                ],
+            }
         self._log_workflow_node_event(
             task_id,
             "qa_review",
@@ -704,9 +742,10 @@ class Orchestrator:
         rejected_claim_id = str(state.get("rejected_claim_id") or "")
         self._ensure_not_stopped(task_id)
         self._log_workflow_node_event(task_id, "repair", "started", "进入自动修复节点：补充来源、降级待确认或修复分析结论。", meta={"claim_id": rejected_claim_id, "qa_round": qa_round})
-        self._auto_repair_open_findings(task_id, qa_round + 1)
+        repaired_count = self._auto_repair_open_findings(task_id, qa_round + 1)
         self._ensure_not_stopped(task_id)
-        self._repair_analysis(task_id, rejected_claim_id, dict(state.get("source_map") or {}))
+        if repaired_count == 0:
+            self._repair_analysis(task_id, rejected_claim_id, dict(state.get("source_map") or {}))
         deep_refresh_needed = bool(state.get("deep_refresh_needed")) or self._analysis_artifact_needs_refresh(task_id)
         self._log_workflow_node_event(task_id, "repair", "finished", "自动修复完成，回到质检节点。", meta={"deep_refresh_needed": deep_refresh_needed})
         return {
@@ -987,8 +1026,16 @@ class Orchestrator:
             return {"status": "needs_review", "result_summary": summary, "finding_id": finding_id, "claim_id": claim["id"]}
 
         updated = self._auto_repair_claim_from_official_sources(task_id, finding, claim)
-        if self._analysis_artifact_needs_refresh(task_id):
-            self._refresh_deep_analysis_from_current_claims(task_id, "质检问题修复后刷新深度分析产物")
+        patch_summary = "已按质检问题补充来源并标记该段需要复核。" if updated else "已尝试自动补采，但该段仍需人工复核来源充分性。"
+        self._patch_latest_analysis_artifact_for_manual_revision(
+            task_id,
+            claim["content"],
+            user_text or finding["reason"],
+            "",
+            claim_id=claim["id"],
+            replacement_text=patch_summary,
+            patch_reason="qa_finding_repair",
+        )
         rejected_claim_id = self._qa_check(task_id, first_pass=False, rework_round=1)
         self._generate_report(task_id, reason="qa_finding_repair")
         self._set_task_completed(task_id)
@@ -4861,7 +4908,7 @@ class Orchestrator:
         evidence = self._evidence_rows_for_task(task_id, limit=10)
         if not self._llm_calls_allowed_for_config(task):
             trace = self._offline_external_trace(
-                "doubao_qa_review",
+                "model_qa_review",
                 sum(len(claim.get("content", "")) for claim in claims) // 4,
             )
             trace["findings"] = []
@@ -4883,7 +4930,7 @@ class Orchestrator:
                 "token_input": max(1, sum(len(claim.get("content", "")) for claim in claims) // 4),
                 "token_output": 1,
                 "fallback_reason": safe_reason,
-                "tool_calls": [{"name": "doubao_qa_review", "result": f"fallback: {safe_reason}"}],
+                "tool_calls": [{"name": "model_qa_review", "result": f"fallback: {safe_reason}"}],
                 "findings": [],
             }
 
@@ -4903,7 +4950,7 @@ class Orchestrator:
         sources = [dict(row) for row in rows]
         if not self._llm_calls_allowed_for_config(task):
             return self._offline_external_trace(
-                "doubao_collection_review",
+                "model_collection_review",
                 sum(len(item.get("excerpt", "")) for item in sources) // 4,
             )
         try:
@@ -4923,7 +4970,7 @@ class Orchestrator:
                 "token_input": max(1, sum(len(item.get("excerpt", "")) for item in sources) // 4),
                 "token_output": 1,
                 "fallback_reason": safe_reason,
-                "tool_calls": [{"name": "doubao_collection_review", "result": f"fallback: {safe_reason}"}],
+                "tool_calls": [{"name": "model_collection_review", "result": f"fallback: {safe_reason}"}],
             }
 
     def _auto_repair_open_findings(self, task_id: str, rework_round: int) -> int:
@@ -5000,6 +5047,232 @@ class Orchestrator:
         )
         return fixed
 
+    def _claim_payload_for_model_repair(self, claim: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        source_ids = row_get(claim, "source_ids", [])
+        if isinstance(source_ids, str):
+            source_ids = loads(source_ids, [])
+        if not isinstance(source_ids, list):
+            source_ids = []
+        return {
+            "id": row_get(claim, "id", ""),
+            "section": row_get(claim, "section", ""),
+            "content": row_get(claim, "content", ""),
+            "confidence": row_get(claim, "confidence", 0),
+            "source_ids": source_ids,
+            "needs_review": bool(row_get(claim, "needs_review", False)),
+            "status": row_get(claim, "status", ""),
+            "uncertainty": row_get(claim, "uncertainty", ""),
+            "claim_type": row_get(claim, "claim_type", ""),
+        }
+
+    def _finding_payload_for_model_repair(self, finding: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any]:
+        if not finding:
+            return {}
+        meta = loads(row_get(finding, "meta_json", "{}"), {})
+        if not isinstance(meta, dict):
+            meta = {}
+        return {
+            "id": row_get(finding, "id", ""),
+            "claim_id": row_get(finding, "claim_id", ""),
+            "severity": row_get(finding, "severity", ""),
+            "reason": row_get(finding, "reason", ""),
+            "target_agent": row_get(finding, "target_agent", ""),
+            "finding_type": row_get(finding, "finding_type", ""),
+            "action_hint": row_get(finding, "action_hint", ""),
+            "meta": sanitize_payload(meta, 900),
+        }
+
+    def _evidence_rows_for_claim_repair(
+        self,
+        task_id: str,
+        claim: sqlite3.Row | dict[str, Any],
+        competitor_names: list[str] | None = None,
+        limit: int = 24,
+    ) -> list[dict[str, Any]]:
+        claim_source_ids = self._claim_payload_for_model_repair(claim).get("source_ids", [])
+        names = [name for name in (competitor_names or []) if name]
+        rows: list[sqlite3.Row] = []
+        seen: set[tuple[str, int]] = set()
+
+        def add_rows(items: list[sqlite3.Row]) -> None:
+            for item in items:
+                key = (str(item["source_id"]), int(item["chunk_index"] or 0))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(item)
+
+        with self.connect() as conn:
+            if claim_source_ids:
+                placeholders = ",".join(["?"] * len(claim_source_ids))
+                add_rows(
+                    conn.execute(
+                        f"""
+                        SELECT c.source_id, c.chunk_index, c.excerpt, c.summary, s.title AS source_title
+                        FROM evidence_chunks c
+                        JOIN sources s ON s.id = c.source_id
+                        WHERE c.task_id = ? AND c.source_id IN ({placeholders})
+                        ORDER BY c.collected_at DESC, c.source_id, c.chunk_index
+                        LIMIT ?
+                        """,
+                        (task_id, *claim_source_ids, limit),
+                    ).fetchall()
+                )
+            for name in names:
+                if len(rows) >= limit:
+                    break
+                add_rows(
+                    conn.execute(
+                        """
+                        SELECT c.source_id, c.chunk_index, c.excerpt, c.summary, s.title AS source_title
+                        FROM evidence_chunks c
+                        JOIN sources s ON s.id = c.source_id
+                        WHERE c.task_id = ?
+                          AND (lower(s.competitor_name) = lower(?) OR s.title LIKE ? OR c.excerpt LIKE ?)
+                        ORDER BY c.collected_at DESC, s.relevance_score DESC, c.source_id, c.chunk_index
+                        LIMIT ?
+                        """,
+                        (task_id, name, f"%{name}%", f"%{name}%", limit),
+                    ).fetchall()
+                )
+            if len(rows) < min(6, limit):
+                add_rows(
+                    conn.execute(
+                        """
+                        SELECT c.source_id, c.chunk_index, c.excerpt, c.summary, s.title AS source_title
+                        FROM evidence_chunks c
+                        JOIN sources s ON s.id = c.source_id
+                        WHERE c.task_id = ?
+                        ORDER BY c.collected_at DESC, c.source_id, c.chunk_index
+                        LIMIT ?
+                        """,
+                        (task_id, limit),
+                    ).fetchall()
+                )
+
+        result = [dict(row) for row in rows[:limit]]
+        for item in result:
+            item["excerpt"] = self._clean_source_excerpt_for_report(str(item.get("excerpt", "")), 700)
+            item["summary"] = self._clean_source_excerpt_for_report(str(item.get("summary", "")), 220)
+        return result
+
+    def _apply_model_repaired_claim(
+        self,
+        task_id: str,
+        claim_id: str,
+        payload: dict[str, Any],
+        valid_source_ids: set[str],
+    ) -> bool:
+        content = sanitize_text(str(payload.get("content", "") or ""), 1200)
+        if not content:
+            return False
+        source_ids = [
+            source_id
+            for source_id in dict.fromkeys(str(item).strip() for item in payload.get("source_ids", []))
+            if source_id and source_id in valid_source_ids
+        ][:5]
+        try:
+            confidence = float(payload.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        if math.isnan(confidence) or math.isinf(confidence):
+            confidence = 0.5
+        confidence = max(0.05, min(0.95, confidence))
+        needs_review = bool(payload.get("needs_review")) or not source_ids
+        status = sanitize_text(str(payload.get("status", "") or ""), 40)
+        if status not in {"reportable", "needs_review", "draft", "confirmed"}:
+            status = "needs_review" if needs_review else "reportable"
+        if needs_review and status == "reportable":
+            status = "needs_review"
+        uncertainty = sanitize_text(str(payload.get("uncertainty", "") or ""), 500)
+        if needs_review and not uncertainty:
+            uncertainty = "DeepSeek 修复后仍需人工或更多来源复核。"
+        claim_type = sanitize_text(str(payload.get("claim_type", "") or ""), 40)
+        if claim_type not in {"fact", "assumption"}:
+            claim_type = "assumption" if needs_review else "fact"
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE claims
+                SET content = ?, confidence = ?, source_ids = ?, needs_review = ?,
+                    status = ?, uncertainty = ?, claim_type = ?, created_at = ?
+                WHERE task_id = ? AND id = ?
+                """,
+                (
+                    content,
+                    confidence,
+                    dumps(source_ids),
+                    1 if needs_review else 0,
+                    status,
+                    uncertainty,
+                    claim_type,
+                    utc_now_iso(),
+                    task_id,
+                    claim_id,
+                ),
+            )
+            self._insert_evidence_links(conn, task_id, "claims", claim_id, source_ids, content[:260])
+        return True
+
+    def _repair_claim_with_deepseek(
+        self,
+        task_id: str,
+        finding: sqlite3.Row | dict[str, Any] | None,
+        claim: sqlite3.Row | dict[str, Any],
+        competitor_names: list[str] | None = None,
+    ) -> dict[str, Any]:
+        task_config = self._task_config(task_id)
+        claim_payload = self._claim_payload_for_model_repair(claim)
+        finding_payload = self._finding_payload_for_model_repair(finding)
+        evidence = self._evidence_rows_for_claim_repair(task_id, claim, competitor_names)
+        started = now_dt()
+        try:
+            result = self.llm_provider.repair_claim_after_qa(task_config, claim_payload, finding_payload, evidence)
+            valid_source_ids = set(self._source_ids_for_task(task_id))
+            updated = self._apply_model_repaired_claim(task_id, claim_payload["id"], result.data, valid_source_ids)
+            output_summary = (
+                "DeepSeek 已根据质检意见和补采来源修复该条结论。"
+                if updated and result.provider == "deepseek"
+                else f"{self._provider_user_label(result.provider)} 已尝试根据质检意见修复该条结论。"
+            )
+            self._log_agent_run(
+                task_id,
+                agent_name="分析 Agent",
+                input_summary=f"按质检问题调用 DeepSeek 修复 claim：{claim_payload['id']}",
+                output_summary=output_summary,
+                status="rerun_completed" if updated else "needs_review",
+                duration_ms=self._elapsed_ms(started),
+                retry_count=1,
+                has_rework=True,
+                token_input=result.input_tokens,
+                token_output=result.output_tokens,
+                model_provider=result.provider,
+                fallback_reason=result.fallback_reason,
+                tool_calls=result.tool_calls + [{"name": "repair_qa_finding_with_model", "result": "updated" if updated else "no_update"}],
+                started_at=started,
+            )
+            return {"updated": updated, "provider": result.provider, "fallback_reason": result.fallback_reason}
+        except LLMProviderError as exc:
+            safe_reason = sanitize_text(str(exc), 240)
+            self._log_agent_run(
+                task_id,
+                agent_name="分析 Agent",
+                input_summary=f"按质检问题调用 DeepSeek 修复 claim：{claim_payload['id']}",
+                output_summary="DeepSeek 修复调用失败，结论保留待复核，等待下一轮质检或人工处理。",
+                status="needs_review",
+                duration_ms=self._elapsed_ms(started),
+                retry_count=1,
+                has_rework=True,
+                error=safe_reason,
+                severity="warning",
+                model_provider="deepseek",
+                fallback_reason=safe_reason,
+                tool_calls=[{"name": "repair_qa_finding_with_model", "result": "failed", "error": safe_reason}],
+                started_at=started,
+            )
+            return {"updated": False, "provider": "deepseek", "fallback_reason": safe_reason}
+
     def _repair_analysis(self, task_id: str, claim_id: str, source_map: dict[str, str]) -> None:
         stage_started = now_dt()
         self._update_task(task_id, "reanalyzing")
@@ -5007,48 +5280,47 @@ class Orchestrator:
             task_id,
             "分析 Agent",
             "analysis_rework_started",
-            "收到质检打回，正在把问题结论改写为带来源或待确认结论。",
+            "收到质检打回，正在调用 DeepSeek 修复问题结论。",
             severity="warning",
             meta={"claim_id": claim_id},
         )
-        task_config = self._task_config(task_id)
-        competitor_label = self._join_names(task_config.get("competitors", []))
-        repair_source_id = source_map.get("src_demo_scope_note") or (self._source_ids_for_task(task_id) or [""])[0]
         with self.connect() as conn:
-            repaired_content = (
-                f"{competitor_label} 的成熟度判断属于高价值且易受版本影响的信息；当前证据不足时只能列为待采集或待人工确认，不能直接断言。"
-            )
-            conn.execute(
+            claim = conn.execute("SELECT * FROM claims WHERE task_id = ? AND id = ?", (task_id, claim_id)).fetchone()
+            finding = conn.execute(
                 """
-                UPDATE claims
-                SET content = ?, confidence = ?, source_ids = ?, needs_review = 1,
-                    status = 'needs_review', uncertainty = ?, claim_type = 'assumption'
-                WHERE id = ? AND task_id = ?
+                SELECT * FROM qa_findings
+                WHERE task_id = ? AND claim_id = ? AND fix_status = 'open'
+                ORDER BY created_at, rowid
+                LIMIT 1
                 """,
-                (
-                    repaired_content,
-                    0.42,
-                    dumps([repair_source_id] if repair_source_id else []),
-                    "当前来源不足以证明成熟度，需要实时采集、上传材料或人工确认。",
-                    claim_id,
-                    task_id,
-                ),
+                (task_id, claim_id),
+            ).fetchone()
+        if not claim:
+            self._log_agent_run(
+                task_id,
+                agent_name="分析 Agent",
+                input_summary="接收质检打回：定位待修复 claim。",
+                output_summary="未找到对应 claim，跳过模型修复并等待质检或人工复核。",
+                status="needs_review",
+                duration_ms=self._elapsed_ms(stage_started),
+                retry_count=1,
+                has_rework=True,
+                severity="warning",
+                tool_calls=[{"name": "repair_claim_with_model", "result": "claim_not_found"}],
+                started_at=stage_started,
             )
-            if repair_source_id:
-                self._insert_evidence_links(conn, task_id, "claims", claim_id, [repair_source_id], repaired_content[:260])
-        self._log_agent_run(
+            return
+        competitors = self._task_config(task_id).get("competitors", [])
+        name = self._competitor_for_claim(claim["content"], competitors)
+        result = self._repair_claim_with_deepseek(task_id, finding, claim, [name] if name else [])
+        self._log_agent_event(
             task_id,
-            agent_name="分析 Agent",
-            input_summary="接收质检打回：关键结论缺少 source_id。",
-            output_summary="已将无来源断言改为不确定结论，绑定样例范围说明并标记待确认。",
-            status="rerun_completed",
-            duration_ms=self._elapsed_ms(stage_started),
-            retry_count=1,
-            has_rework=True,
-            tool_calls=[{"name": "repair_claim_with_source_policy", "result": "fixed"}],
-            started_at=stage_started,
+            "分析 Agent",
+            "analysis_rework_finished",
+            "DeepSeek 打回修复完成，等待质检复检。" if result.get("updated") else "DeepSeek 打回修复未能生成可用更新，等待质检或人工复核。",
+            severity="info" if result.get("updated") else "warning",
+            meta={"claim_id": claim_id, "provider": result.get("provider", ""), "fallback_reason": result.get("fallback_reason", "")},
         )
-        self._log_agent_event(task_id, "分析 Agent", "analysis_rework_finished", "打回修复完成，等待质检复检。")
 
     def _mark_finding_fixed(self, task_id: str, finding_id: str, result: str) -> None:
         with self.connect() as conn:
@@ -5082,24 +5354,22 @@ class Orchestrator:
                 inserted_count += len(drafts)
         self._refresh_pricing_facts(task_id)
 
-        updated = False
-        for name in names:
-            if claim["section"] == "pricing_model":
-                updated = self._repair_pricing_claim(task_id, claim["id"], name) or updated
-            else:
-                updated = self._repair_nonpricing_claim(task_id, claim["id"], name, claim["section"]) or updated
-        self._log_agent_run(
+        repair_result = self._repair_claim_with_deepseek(task_id, finding, claim, names)
+        self._log_agent_event(
             task_id,
-            agent_name="分析 Agent",
-            input_summary=f"按质检问题自动补采官方来源并修复 claim：{finding['id']}",
-            output_summary=f"已补采/复用官方种子来源 {inserted_count} 条，并{'更新' if updated else '尝试更新'}相关结论。",
-            status="rerun_completed" if updated else "needs_review",
-            duration_ms=6400,
-            retry_count=1,
-            has_rework=True,
-            tool_calls=[{"name": "repair_qa_finding", "result": "updated" if updated else "no_extractable_fact"}],
+            "分析 Agent",
+            "qa_rework_model_repair_finished",
+            f"质检打回后已补采/复用官方种子来源 {inserted_count} 条，并调用模型修复该条结论。",
+            severity="info" if repair_result.get("updated") else "warning",
+            meta={
+                "finding_id": finding["id"],
+                "claim_id": claim["id"],
+                "inserted_source_count": inserted_count,
+                "provider": repair_result.get("provider", ""),
+                "updated": bool(repair_result.get("updated")),
+            },
         )
-        return updated
+        return bool(repair_result.get("updated"))
 
     def _collect_rework_search_drafts(self, task_id: str, name: str, section: str, meta: dict[str, Any]) -> list[WebSourceDraft]:
         suggested = meta.get("suggested_queries") if isinstance(meta, dict) else []
@@ -5394,7 +5664,17 @@ class Orchestrator:
             retry_count=1,
             tool_calls=[{"name": "bind_manual_source_to_claim", "result": claim_id or "new_overview_claim", "source_id": source_id}],
         )
-        self._refresh_deep_analysis_from_current_claims(task_id, "人工补充来源后刷新深度分析产物")
+        patch_selected_text = selected_text or (row_get(updated_claim, "content", "") if updated_claim else "")
+        patch_replacement = f"该段已补充人工来源，等待质检复核来源是否足以支撑结论：{sanitize_markdown_text(user_text, 800)}"
+        self._patch_latest_analysis_artifact_for_manual_revision(
+            task_id,
+            patch_selected_text,
+            user_text,
+            source_id,
+            claim_id=claim_id,
+            replacement_text=patch_replacement,
+            patch_reason="manual_source",
+        )
         if claim_id:
             return "已补充人工来源并绑定到目标结论，等待重新质检决定是否关闭该问题。"
         self._qa_check(task_id, first_pass=False)
@@ -5444,17 +5724,186 @@ class Orchestrator:
         return scored[0][1] if scored and scored[0][0] >= 0.45 else None
 
     def _manual_revision_replacement_text(self, user_text: str, selected_text: str) -> str:
-        instruction = sanitize_text(user_text, 420)
-        original = sanitize_text(selected_text, 260)
-        return (
-            f"【人工修正待复核】该段已按人工反馈进入重分析：{instruction}"
-            + (f" 原选中表述：{original}" if original else "")
-            + " 系统已重新质检并生成新报告版本；正式定稿前需核对新增来源和待复核状态。"
-        )
+        return self._manual_revision_clean_claim_text("", "overview", selected_text, user_text, {})
+
+    def _manual_revision_intent(
+        self,
+        task_id: str,
+        selected_text: str,
+        user_text: str,
+        target_claim: sqlite3.Row | None,
+    ) -> dict[str, Any]:
+        task_config = self._task_config(task_id)
+        claim_payload = dict(target_claim) if target_claim else {}
+        try:
+            result = self.llm_provider.interpret_manual_revision(task_config, selected_text, user_text, claim_payload)
+            intent = dict(result.data)
+            intent["provider"] = result.provider
+            intent["tool_calls"] = result.tool_calls
+            intent["fallback_reason"] = result.fallback_reason
+        except Exception as exc:
+            intent = {"fallback_reason": sanitize_text(str(exc), 240), "tool_calls": []}
+        return self._normalize_manual_revision_intent(task_config, selected_text, user_text, claim_payload, intent)
+
+    def _normalize_manual_revision_intent(
+        self,
+        task_config: dict[str, Any],
+        selected_text: str,
+        user_text: str,
+        claim: dict[str, Any],
+        intent: dict[str, Any],
+    ) -> dict[str, Any]:
+        competitors = [str(name) for name in task_config.get("competitors", []) if str(name).strip()]
+        haystack = f"{selected_text} {user_text} {claim.get('content', '')}"
+        target = sanitize_text(str(intent.get("target_competitor") or ""), 120)
+        if not target or not any(self._manual_name_matches(target, name) for name in competitors):
+            target = self._competitor_for_claim(haystack, competitors)
+        if re.search(r"\bgpt[-\s]?\d|openai|chatgpt", haystack, flags=re.I):
+            openai_target = next(
+                (
+                    name for name in competitors
+                    if name and re.search(r"chatgpt|openai", f"{name} {' '.join(PRODUCT_ALIASES.get(name.casefold(), []))}", flags=re.I)
+                ),
+                "",
+            )
+            if openai_target:
+                target = openai_target
+        section = sanitize_text(str(intent.get("target_section") or claim.get("section") or "overview"), 80)
+        if section not in {"overview", "feature_tree", "pricing_model", "user_persona", "reviews", "swot"}:
+            section = claim.get("section") or "overview"
+        target_fact = sanitize_text(str(intent.get("target_fact") or self._manual_target_fact_from_text(haystack)), 220)
+        correction = sanitize_text(str(intent.get("expected_correction") or user_text), 260)
+        queries = [
+            sanitize_text(str(query), 140)
+            for query in intent.get("search_queries", [])
+            if sanitize_text(str(query), 140)
+        ] if isinstance(intent.get("search_queries"), list) else []
+        if not queries:
+            queries = self._manual_revision_default_queries(target, section, user_text)
+        return {
+            **intent,
+            "target_competitor": target,
+            "target_section": section,
+            "target_fact": target_fact,
+            "expected_correction": correction,
+            "requires_external_verification": True,
+            "search_queries": list(dict.fromkeys(queries))[:4],
+        }
+
+    def _manual_name_matches(self, candidate: str, competitor: str) -> bool:
+        candidate_key = (candidate or "").casefold()
+        competitor_key = (competitor or "").casefold()
+        if candidate_key and (candidate_key in competitor_key or competitor_key in candidate_key):
+            return True
+        aliases = PRODUCT_ALIASES.get(competitor_key, [])
+        return any(alias.casefold() in candidate_key or candidate_key in alias.casefold() for alias in aliases)
+
+    def _manual_target_fact_from_text(self, text: str) -> str:
+        if re.search(r"gpt[-\s]?5(?:\.5)?|gpt[-\s]?4o|订阅|定价|pricing|plan", text, flags=re.I):
+            return "主打模型、订阅权益和官方定价口径"
+        if re.search(r"价格|套餐|api|token|成本", text, flags=re.I):
+            return "价格、套餐和 API 成本口径"
+        if re.search(r"功能|模型|多模态|agent|代码|推理", text, flags=re.I):
+            return "产品功能和模型能力口径"
+        return sanitize_text(text, 120) or "目标结论"
+
+    def _manual_revision_default_queries(self, target: str, section: str, user_text: str) -> list[str]:
+        base = target or "目标竞品"
+        if re.search(r"gpt|openai|chatgpt", f"{target} {user_text}", flags=re.I):
+            return [
+                "OpenAI ChatGPT pricing plans official",
+                "OpenAI ChatGPT release notes GPT-5 official",
+                "OpenAI ChatGPT subscription plans official",
+            ]
+        if section == "pricing_model" or re.search(r"价格|定价|订阅|pricing|plan|api|token", user_text, flags=re.I):
+            return [f"{base} 官方 定价 订阅", f"{base} pricing plans official", f"{base} API pricing official"]
+        return [f"{base} 官方 产品 功能", f"{base} release notes official", f"{base} docs official"]
+
+    def _manual_revision_clean_claim_text(
+        self,
+        target: str,
+        section: str,
+        selected_text: str,
+        user_text: str,
+        intent: dict[str, Any],
+    ) -> str:
+        target_label = target or "目标竞品"
+        target_fact = sanitize_text(str(intent.get("target_fact") or self._manual_target_fact_from_text(f"{selected_text} {user_text}")), 180)
+        if re.search(r"gpt[-\s]?5(?:\.5)?|gpt[-\s]?4o|openai|chatgpt", f"{target_label} {selected_text} {user_text}", flags=re.I):
+            return (
+                f"{target_label} 的{target_fact}需要以官方定价页、订阅页或发布说明重新核验；"
+                "在缺少权威来源前，不应把 GPT-4o、GPT-5 或 GPT-5.5 等版本口径写成确定事实。"
+            )
+        if section == "pricing_model":
+            return f"{target_label} 的{target_fact}具有时间敏感性，需以官方定价页或订阅权益页面核验后再形成确定结论。"
+        return f"{target_label} 的{target_fact}当前仍需官方或可信来源核验；在证据不足时只保留为待核验判断。"
+
+    def _is_markdown_table_line(self, line: str) -> bool:
+        stripped = line.strip()
+        if "|" not in stripped:
+            return False
+        cells = stripped.strip("|").split("|")
+        return len(cells) >= 2
+
+    def _is_markdown_table_separator_line(self, line: str) -> bool:
+        stripped = line.strip().strip("|")
+        cells = [cell.strip() for cell in stripped.split("|")]
+        return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+    def _manual_review_note(self, replacement: str) -> str:
+        text = sanitize_markdown_text(replacement, 1800).replace("\n", " ").strip()
+        return f"> 人工复核：{text or '该段已标记为待复核。'}"
+
+    def _manual_review_table_row(self, line: str, replacement: str) -> str:
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 2:
+            return self._manual_review_note(replacement)
+        new_cells = ["人工复核", self._markdown_cell(replacement, 260)]
+        if len(cells) > 2:
+            new_cells.extend(["待复核"] * (len(cells) - 2))
+        return "| " + " | ".join(new_cells[: len(cells)]) + " |"
+
+    def _patch_markdown_table_for_manual_revision(self, text: str, selected_text: str, replacement: str) -> tuple[str, bool]:
+        if not selected_text or "|" not in text:
+            return text, False
+        lines = text.splitlines()
+        selected_line_count = len([line for line in selected_text.splitlines() if line.strip()])
+        index = 0
+        while index < len(lines):
+            if not self._is_markdown_table_line(lines[index]):
+                index += 1
+                continue
+            start = index
+            while index < len(lines) and self._is_markdown_table_line(lines[index]):
+                index += 1
+            end = index
+            block = "\n".join(lines[start:end])
+            score = 1.0 if selected_text in block else self._manual_match_score(selected_text, block)
+            if score < 0.62:
+                continue
+            row_index = -1
+            if selected_line_count <= 1:
+                for row_pos in range(start, end):
+                    row = lines[row_pos]
+                    if self._is_markdown_table_separator_line(row):
+                        continue
+                    row_score = 1.0 if selected_text in row else self._manual_match_score(selected_text, row)
+                    if row_score >= 0.82:
+                        row_index = row_pos
+                        break
+            if row_index >= 0:
+                lines[row_index] = self._manual_review_table_row(lines[row_index], replacement)
+            else:
+                lines[start:end] = [self._manual_review_note(replacement)]
+            return "\n".join(lines), True
+        return text, False
 
     def _patch_text_for_manual_revision(self, text: str, selected_text: str, replacement: str) -> tuple[str, bool]:
         if not text:
             return text, False
+        table_patched, table_changed = self._patch_markdown_table_for_manual_revision(text, selected_text, replacement)
+        if table_changed:
+            return table_patched, True
         if selected_text and selected_text in text:
             return text.replace(selected_text, replacement, 1), True
         blocks = re.split(r"(\n{2,})", text)
@@ -5473,6 +5922,36 @@ class Orchestrator:
         suffix = "\n\n" if text.strip() else ""
         return f"{text.rstrip()}{suffix}{replacement}", False
 
+    def _latest_report_content_for_manual_patch(self, task_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT content_json FROM reports WHERE task_id = ? ORDER BY version DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if not row:
+            return {}
+        content = loads(row["content_json"], {})
+        return content if isinstance(content, dict) else {}
+
+    def _manual_patch_base_sections(self, task_id: str, artifact: dict[str, Any]) -> list[dict[str, Any]]:
+        content = self._latest_report_content_for_manual_patch(task_id)
+        react_report = content.get("react_report", {}) if isinstance(content.get("react_report"), dict) else {}
+        candidates = react_report.get("sections") or content.get("display_sections") or artifact.get("sections") or []
+        return [dict(section) for section in candidates if isinstance(section, dict)]
+
+    def _manual_sections_to_markdown(self, sections: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for index, section in enumerate(sections, start=1):
+            title = sanitize_text(str(section.get("title") or f"人工复核章节 {index}"), 160)
+            body = str(section.get("markdown") or section.get("body") or "").strip()
+            if not body:
+                continue
+            if re.match(r"^##\s+", body):
+                parts.append(body)
+            else:
+                parts.append(f"## {title}\n\n{body}".strip())
+        return sanitize_markdown_text("\n\n".join(parts), 120000)
+
     def _patch_latest_analysis_artifact_for_manual_revision(
         self,
         task_id: str,
@@ -5480,41 +5959,50 @@ class Orchestrator:
         user_text: str,
         source_id: str,
         claim_id: str = "",
+        replacement_text: str = "",
+        patch_reason: str = "manual_revision",
     ) -> bool:
         artifact = self._latest_analysis_artifact(task_id)
-        if not artifact:
+        sections = self._manual_patch_base_sections(task_id, artifact)
+        if not artifact and not sections:
             return False
-        replacement = self._manual_revision_replacement_text(user_text, selected_text)
-        sections = [dict(section) for section in artifact.get("sections") or [] if isinstance(section, dict)]
+        replacement = sanitize_markdown_text(replacement_text, 3000) if replacement_text else self._manual_revision_replacement_text(user_text, selected_text)
+        if not replacement:
+            return False
         patched_sections: list[dict[str, Any]] = []
         patched_section = False
+        best_index = -1
+        best_score = 0.0
         for section in sections:
             item = dict(section)
             body = str(item.get("markdown") or item.get("body") or "")
+            score = self._manual_match_score(selected_text, f"{item.get('title', '')}\n{body}") if selected_text else 0.0
+            if score > best_score:
+                best_score = score
+                best_index = len(patched_sections)
             patched_body, changed = self._patch_text_for_manual_revision(body, selected_text, replacement)
             if changed and not patched_section:
                 patched_section = True
                 if item.get("markdown"):
                     item["markdown"] = patched_body
                 item["body"] = patched_body
-                item.setdefault("manual_revision", True)
+                item["manual_revision"] = True
+                item["manual_patch_reason"] = patch_reason
                 item["manual_revision_source_id"] = source_id
             patched_sections.append(item)
-        markdown, patched_markdown = self._patch_text_for_manual_revision(
-            str(artifact.get("analysis_markdown") or ""),
-            selected_text,
-            replacement,
-        )
         if not patched_section and patched_sections:
-            first = dict(patched_sections[0])
-            body = str(first.get("markdown") or first.get("body") or "")
-            body = f"{body.rstrip()}\n\n{replacement}" if body.strip() else replacement
-            if first.get("markdown"):
-                first["markdown"] = body
-            first["body"] = body
-            first.setdefault("manual_revision", True)
-            first["manual_revision_source_id"] = source_id
-            patched_sections[0] = first
+            target_index = best_index if best_index >= 0 and (best_score >= 0.18 or selected_text) else 0
+            target = dict(patched_sections[target_index])
+            body = str(target.get("markdown") or target.get("body") or "")
+            note = self._manual_review_note(replacement)
+            body = f"{body.rstrip()}\n\n{note}" if body.strip() else note
+            if target.get("markdown"):
+                target["markdown"] = body
+            target["body"] = body
+            target["manual_revision"] = True
+            target["manual_patch_reason"] = patch_reason
+            target["manual_revision_source_id"] = source_id
+            patched_sections[target_index] = target
             patched_section = True
         if not patched_sections and replacement:
             patched_sections = [
@@ -5524,17 +6012,18 @@ class Orchestrator:
                     "body": replacement,
                     "markdown": replacement,
                     "manual_revision": True,
+                    "manual_patch_reason": patch_reason,
                     "manual_revision_source_id": source_id,
                 }
             ]
             patched_section = True
-        if not patched_markdown:
-            markdown = f"{str(artifact.get('analysis_markdown') or '').rstrip()}\n\n{replacement}".strip()
+        markdown = self._manual_sections_to_markdown(patched_sections)
         tool_calls = list(artifact.get("tool_calls") or [])
         tool_calls.append(
             {
                 "name": "manual_revision_patch_selected_report_text",
                 "result": "patched" if patched_section else "appended",
+                "reason": patch_reason,
                 "source_id": source_id,
                 "claim_id": claim_id,
             }
@@ -5543,6 +6032,7 @@ class Orchestrator:
             task_id,
             {
                 **artifact,
+                "provider": artifact.get("provider") or "manual-local-patch",
                 "analysis_markdown": markdown,
                 "sections": patched_sections,
                 "tool_calls": tool_calls,
@@ -5557,11 +6047,22 @@ class Orchestrator:
         target_claim_id = ""
         target_section = "overview"
         revision_finding_id = uuid.uuid4().hex
+        revision_intent: dict[str, Any] = {}
         with self.connect() as conn:
             target_claim = self._find_manual_revision_claim(conn, task_id, selected_text, claim_id)
             if target_claim:
                 target_claim_id = target_claim["id"]
                 target_section = target_claim["section"] or target_section
+            revision_intent = self._manual_revision_intent(task_id, selected_text, user_text, target_claim)
+            target_competitor = sanitize_text(str(revision_intent.get("target_competitor") or ""), 120)
+            target_section = sanitize_text(str(revision_intent.get("target_section") or target_section), 80) or target_section
+            revised_claim_content = self._manual_revision_clean_claim_text(
+                target_competitor,
+                target_section,
+                selected_text,
+                user_text,
+                revision_intent,
+            )
             conn.execute(
                 """
                 INSERT INTO sources
@@ -5579,15 +6080,13 @@ class Orchestrator:
                     "",
                     utc_now_iso(),
                     "medium",
-                    sanitize_text(f"选中文本：{selected_excerpt}\n修正说明：{revision_text}", 900),
+                    sanitize_text(f"待核验事实线索：{revised_claim_content}", 900),
                     dumps([target_claim_id] if target_claim_id else []),
                 ),
             )
-            self._insert_text_evidence(conn, task_id, source_id, sanitize_text(f"{selected_excerpt}\n{revision_text}", 1200), utc_now_iso())
-            revised_claim_content = self._manual_revision_replacement_text(user_text, selected_text)
             if target_claim:
                 existing_sources = loads(target_claim["source_ids"], [])
-                merged_sources = list(dict.fromkeys([*existing_sources, source_id]))
+                merged_sources = list(dict.fromkeys(existing_sources))
                 conn.execute(
                     """
                     UPDATE claims
@@ -5599,12 +6098,13 @@ class Orchestrator:
                         sanitize_text(revised_claim_content, 1200),
                         round(min(float(target_claim["confidence"] or 0.68), 0.62), 2),
                         dumps(merged_sources),
-                        f"人工要求修正该结论：{sanitize_text(user_text, 220)}。需重新搜索、质检或补充来源后确认。",
+                        "该结论已按复核要求降级为待核验口径，需以新增官方或可信来源确认后再关闭。",
                         task_id,
                         target_claim_id,
                     ),
                 )
-                self._insert_evidence_links(conn, task_id, "claims", target_claim_id, [source_id], revised_claim_content[:260])
+                if merged_sources:
+                    self._insert_evidence_links(conn, task_id, "claims", target_claim_id, merged_sources, revised_claim_content[:260])
             else:
                 target_claim_id = uuid.uuid4().hex
                 self._insert_claims(
@@ -5615,11 +6115,11 @@ class Orchestrator:
                             "section": target_section,
                             "content": revised_claim_content,
                             "confidence": 0.62,
-                            "source_ids": [source_id],
+                            "source_ids": [],
                             "needs_review": True,
                             "status": "needs_review",
                             "claim_type": "inference",
-                            "uncertainty": "人工修正意见已入库，外部事实仍需来源支撑。",
+                            "uncertainty": "该结论需以官方或可信来源核验后再作为确定事实。",
                         }
                     ],
                     conn=conn,
@@ -5647,6 +6147,9 @@ class Orchestrator:
                                 "manual_review_state": "awaiting_recheck",
                                 "manual_source_id": source_id,
                                 "affected_section": target_section,
+                                "affected_competitors": [target_competitor] if target_competitor else [],
+                                "suggested_queries": revision_intent.get("search_queries", []),
+                                "revision_intent": revision_intent,
                                 "selected_text": sanitize_text(selected_text, 500),
                                 "repair_action": "manual_supplement",
                                 "can_auto_repair": True,
@@ -5692,21 +6195,32 @@ class Orchestrator:
             task_id,
             agent_name="分析 Agent",
             input_summary="人工复查要求修正结论。",
-            output_summary="已定位选中段落/目标结论，写入人工修正来源并标记为待复核。",
+            output_summary="已定位选中段落/目标结论，保存复核意图并将正式结论改为待核验口径。",
             status="rerun_completed",
             duration_ms=8600,
             retry_count=1,
             has_rework=True,
-            tool_calls=[{"name": "manual_revision_update_claim", "claim_id": target_claim_id, "source_id": source_id}],
+            model_provider=revision_intent.get("provider", ""),
+            fallback_reason=revision_intent.get("fallback_reason", ""),
+            tool_calls=[
+                *list(revision_intent.get("tool_calls") or []),
+                {"name": "manual_revision_update_claim", "claim_id": target_claim_id, "source_id": source_id, "intent": revision_intent},
+            ],
         )
-        self._refresh_deep_analysis_from_current_claims(task_id, "人工修正结论后刷新深度分析产物")
-        patched = self._patch_latest_analysis_artifact_for_manual_revision(task_id, selected_text, user_text, source_id, target_claim_id)
+        self._patch_latest_analysis_artifact_for_manual_revision(
+            task_id,
+            selected_text,
+            user_text,
+            source_id,
+            claim_id=target_claim_id,
+            patch_reason="manual_revision",
+        )
         self._log_agent_event(
             task_id,
             "分析 Agent",
-            "manual_revision_selected_text_patched",
-            "已将人工修正写回深度报告目标段落。" if patched else "未找到深度报告产物，人工修正已保留在结构化结论中。",
-            meta={"claim_id": target_claim_id, "source_id": source_id, "patched": patched},
+            "manual_revision_clean_claim_written",
+            "人工复核已转为结构化待核验结论；用户原始问题只保留在复核工作台，不写入正式报告正文。",
+            meta={"claim_id": target_claim_id, "source_id": source_id, "intent": revision_intent},
         )
         self._qa_check(task_id, first_pass=False)
         self._generate_report(task_id, reason="manual_revision")
@@ -5829,7 +6343,16 @@ class Orchestrator:
             has_rework=True,
             tool_calls=[{"name": "manual_dispute_claim", "claim_id": claim_id, "source_id": source_id}],
         )
-        self._refresh_deep_analysis_from_current_claims(task_id, "人工质疑后刷新深度分析产物")
+        dispute_replacement = f"该段已被人工质疑并降级为待复核，需补充来源、降级结论或重写局部表述：{sanitize_markdown_text(user_text, 800)}"
+        self._patch_latest_analysis_artifact_for_manual_revision(
+            task_id,
+            selected_text or target_claim["content"],
+            user_text,
+            source_id,
+            claim_id=claim_id,
+            replacement_text=dispute_replacement,
+            patch_reason="manual_dispute",
+        )
         self._qa_check(task_id, first_pass=False)
         dispute_finding_id = uuid.uuid4().hex
         with self.connect() as conn:
@@ -5880,6 +6403,7 @@ class Orchestrator:
         source_id = f"{task_id[:8]}_manual_confirm_{uuid.uuid4().hex[:8]}"
         confirmation_text = sanitize_text(user_text or "人工确认该结论无误。", 900)
         confirmed_claim_id = claim_id
+        confirmed_claim_content = ""
         confidence_before = None
         confidence_after = None
         with self.connect() as conn:
@@ -5899,6 +6423,7 @@ class Orchestrator:
                 ).fetchone()
             if row:
                 confirmed_claim_id = row["id"]
+                confirmed_claim_content = row["content"]
                 source_ids = loads(row["source_ids"], [])
                 merged_source_ids = list(dict.fromkeys([*source_ids, source_id]))
                 confidence_before = float(row["confidence"] or 0)
@@ -5990,6 +6515,16 @@ class Orchestrator:
             retry_count=1,
             tool_calls=[{"name": "manual_confirmation", "claim_id": confirmed_claim_id, "source_id": source_id, "confidence_after": confidence_after}],
         )
+        if confirmed_claim_id:
+            self._patch_latest_analysis_artifact_for_manual_revision(
+                task_id,
+                confirmed_claim_content,
+                user_text,
+                source_id,
+                claim_id=confirmed_claim_id,
+                replacement_text=f"该结论已由人工确认并保留在报告中：{sanitize_markdown_text(confirmation_text, 800)}",
+                patch_reason="manual_confirmation",
+            )
         self._generate_report(task_id, reason="manual_confirmation")
         self._set_task_completed(task_id)
         return "当前结论已记录为人工确认，并生成新的报告版本。" if claim_id else "低置信度结论已记录为人工确认，并生成新的报告版本。"
@@ -8698,8 +9233,13 @@ class Orchestrator:
         self._insert_evidence_links(conn, task_id, entity_type, item_id, claim.get("source_ids", []), content[:260])
 
     def _competitor_for_claim(self, content: str, competitors: list[str]) -> str:
+        haystack = (content or "").casefold()
         for name in competitors:
-            if name and name.casefold() in (content or "").casefold():
+            if not name:
+                continue
+            key = name.casefold()
+            aliases = [key] + [alias.casefold() for alias in PRODUCT_ALIASES.get(key, [])]
+            if any(alias and alias in haystack for alias in aliases):
                 return name
         return competitors[0] if competitors else "综合"
 
@@ -8998,6 +9538,8 @@ class Orchestrator:
     def _provider_user_label(self, value: str) -> str:
         return {
             "doubao": "豆包大模型",
+            "deepseek": "DeepSeek",
+            "zhipu": "智谱",
             "doubao-react": "豆包 ReAct 深度分析",
             "deepseek-react": "DeepSeek ReAct 深度分析",
             "local-react-fallback": "本地深度分析备用规则",

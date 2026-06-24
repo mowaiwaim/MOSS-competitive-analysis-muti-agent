@@ -17,6 +17,9 @@ from schema import LLMClaimDraft
 DEFAULT_DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_DOUBAO_MODEL_NAME = "Doubao-Seed-2.0-lite"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+MODEL_STEP_TIMEOUT_SECONDS = 600
+DEEPSEEK_TIMEOUT_SECONDS = 300
 
 
 class LLMProviderError(RuntimeError):
@@ -47,6 +50,14 @@ class LLMJSONResult:
 
 def estimate_tokens(text: str) -> int:
     return max(1, len(text or "") // 4)
+
+
+def _read_int_env(name: str, default: int, minimum: int = 30, maximum: int = 1800) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def build_prompt(task: dict[str, Any], evidence: list[dict[str, Any]]) -> str:
@@ -142,6 +153,50 @@ def build_qa_prompt(task: dict[str, Any], claims: list[dict[str, Any]], evidence
         "finding_type 可用 missing_source, unsupported_claim, pricing_missing_official, missing_date, source_ownership_mismatch, overclaim, logic_gap, review_sample_bias, swot_template。"
         "不要输出 API Key 或额外解释。\n"
         f"输入：{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def build_qa_repair_prompt(
+    task: dict[str, Any],
+    claim: dict[str, Any],
+    finding: dict[str, Any],
+    evidence: list[dict[str, Any]],
+) -> str:
+    allowed_source_ids = list(
+        dict.fromkeys(
+            str(item.get("source_id", "") or item.get("id", "")).strip()
+            for item in evidence
+            if str(item.get("source_id", "") or item.get("id", "")).strip()
+        )
+    )
+    evidence_lines = []
+    for item in evidence[:24]:
+        source_id = str(item.get("source_id", "") or item.get("id", ""))
+        evidence_lines.append(
+            f"- source_id={source_id} chunk={item.get('chunk_index', 0)} "
+            f"title={item.get('source_title', item.get('title', ''))}: "
+            f"{str(item.get('excerpt', '') or item.get('summary', ''))[:700]}"
+        )
+    payload = {
+        "industry": task.get("industry", ""),
+        "competitors": task.get("competitors", []),
+        "focus_areas": task.get("focus_areas", []),
+        "claim": claim,
+        "qa_finding": finding,
+        "allowed_source_ids": allowed_source_ids,
+    }
+    return (
+        "你是竞品分析系统的质检打回修复 Agent。只修复输入中的单条 claim，不要重写整份报告，不要扩展其他章节。"
+        "你必须基于给定 evidence 改写 claim；不得编造 evidence 中没有的事实、价格、版本、排名、用户评价或发布日期。"
+        "如果 evidence 仍不足以证明结论，就把 claim 改成保守的待复核表述，降低 confidence，并设置 needs_review=true、status=needs_review。"
+        "如果 evidence 可以支撑结论，就输出可进入报告的业务判断，并绑定 source_ids。"
+        "source_ids 只能从 allowed_source_ids 中选择；如果没有足够来源，不要伪造 source_id。"
+        "价格、套餐、API 单价等时间敏感信息必须有明确来源才可输出具体数值；否则只能写成价格缺口或待复核。"
+        "输出必须是合法 JSON 对象，不要 Markdown，不要解释。格式："
+        '{"content":"修复后的单条结论", "confidence":0.0, "source_ids":["..."], '
+        '"needs_review":true, "status":"reportable|needs_review", '
+        '"uncertainty":"为什么仍需复核或采集", "claim_type":"fact|assumption"}'
+        f"\n输入：{json.dumps(payload, ensure_ascii=False)}\nEvidence:\n" + "\n".join(evidence_lines)
     )
 
 
@@ -334,22 +389,67 @@ class LLMProvider:
         self.deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", "")
         self.deepseek_model_id = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
         self.deepseek_base_url = os.environ.get("DEEPSEEK_API_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/")
-        try:
-            self.timeout_seconds = max(5, min(60, int(os.environ.get("DOUBAO_TIMEOUT_SECONDS", "20"))))
-        except ValueError:
-            self.timeout_seconds = 20
-        try:
-            self.deepseek_timeout_seconds = max(5, min(90, int(os.environ.get("DEEPSEEK_RESEARCH_TIMEOUT_SECONDS", "45"))))
-        except ValueError:
-            self.deepseek_timeout_seconds = 45
+        self.zhipu_api_key = os.environ.get("ZHIPU_API_KEY", "")
+        self.zhipu_model_id = os.environ.get("ZHIPU_MODEL", "")
+        self.zhipu_base_url = os.environ.get("ZHIPU_BASE_URL", DEFAULT_ZHIPU_BASE_URL).rstrip("/")
+        self.timeout_seconds = MODEL_STEP_TIMEOUT_SECONDS
+        self.deepseek_timeout_seconds = _read_int_env(
+            "DEEPSEEK_RESEARCH_TIMEOUT_SECONDS",
+            DEEPSEEK_TIMEOUT_SECONDS,
+            minimum=30,
+            maximum=DEEPSEEK_TIMEOUT_SECONDS,
+        )
+
+    def _timeout_for_provider(self, provider: str) -> int:
+        if provider == "deepseek":
+            return self.deepseek_timeout_seconds
+        return self.timeout_seconds
 
     def _use_deepseek_for_research_generation(self) -> bool:
         return bool(self.deepseek_api_key and self.deepseek_model_id and self.configured_provider != "mock")
 
     def generate_claims(self, task: dict[str, Any], evidence: list[dict[str, Any]]) -> LLMResult:
         prompt = build_prompt(task, evidence)
-        if self.provider == "doubao":
-            return self._generate_with_doubao(prompt, evidence)
+        failures: list[dict[str, Any]] = []
+        for provider in self._json_provider_order():
+            try:
+                if provider == "doubao":
+                    result = self._generate_with_doubao(prompt, evidence)
+                    result.fallback_reason = "; ".join(call["error"] for call in failures)
+                    result.tool_calls = failures + result.tool_calls
+                    return result
+                payload = self._chat_json_for_provider(
+                    provider,
+                    prompt,
+                    self._timeout_for_provider(provider),
+                    require_object=False,
+                )
+                raw_claims = payload.get("claims", payload) if isinstance(payload, dict) else payload
+                claims = self._validate_claims(raw_claims, evidence)
+                return LLMResult(
+                    provider=provider,
+                    claims=claims,
+                    input_tokens=estimate_tokens(prompt),
+                    output_tokens=estimate_tokens(json.dumps(raw_claims, ensure_ascii=False)),
+                    fallback_reason="; ".join(call["error"] for call in failures),
+                    tool_calls=failures + [{"name": f"{provider}_chat_completions", "result": "generate_claims"}],
+                )
+            except (LLMProviderError, TypeError, ValidationError, ValueError) as exc:
+                failures.append(
+                    {
+                        "name": "model_provider_failover",
+                        "provider": provider,
+                        "result": "failed",
+                        "operation": "generate_claims",
+                        "error": str(exc)[:240],
+                    }
+                )
+        if failures:
+            result = self._generate_with_mock(prompt, evidence)
+            result.used_fallback = True
+            result.fallback_reason = "; ".join(call["error"] for call in failures)
+            result.tool_calls = failures + result.tool_calls
+            return result
         return self._generate_with_mock(prompt, evidence)
 
     def rewrite_report(self, task: dict[str, Any], sections: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> LLMJSONResult:
@@ -377,71 +477,118 @@ class LLMProvider:
 
     def review_claims(self, task: dict[str, Any], claims: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> LLMJSONResult:
         prompt = build_qa_prompt(task, claims, evidence)
-        if self.provider != "doubao":
-            return LLMJSONResult(
-                provider="mock",
-                data={"passed": True, "findings": [], "summary": "mock qa skipped"},
-                input_tokens=estimate_tokens(prompt),
-                output_tokens=1,
-                used_fallback=True,
-                fallback_reason="未配置豆包，使用规则质检。",
-                tool_calls=[{"name": "mock_qa_review", "result": "skipped"}],
-            )
-        payload = self._chat_json(prompt, timeout=self.timeout_seconds)
-        if not isinstance(payload.get("passed"), bool) or not isinstance(payload.get("findings", []), list):
-            raise LLMProviderError("doubao qa schema validation failed")
-        return LLMJSONResult(
-            provider="doubao",
-            data=payload,
-            input_tokens=estimate_tokens(prompt),
-            output_tokens=estimate_tokens(json.dumps(payload, ensure_ascii=False)),
-            tool_calls=[{"name": "doubao_chat_completions", "result": "qa_review"}],
+        return self._json_failover(
+            prompt,
+            operation="qa_review",
+            validate=lambda payload: isinstance(payload.get("passed"), bool) and isinstance(payload.get("findings", []), list),
+            fallback_data={"passed": True, "findings": [], "summary": "规则质检兜底：模型链路不可用。"},
+            fallback_tool="rules_qa_review",
+            fallback_reason="模型质检链路不可用，使用规则质检。",
+        )
+
+    def repair_claim_after_qa(
+        self,
+        task: dict[str, Any],
+        claim: dict[str, Any],
+        finding: dict[str, Any],
+        evidence: list[dict[str, Any]],
+    ) -> LLMJSONResult:
+        prompt = build_qa_repair_prompt(task, claim, finding, evidence)
+        existing_source_ids = claim.get("source_ids", [])
+        if isinstance(existing_source_ids, str):
+            try:
+                existing_source_ids = json.loads(existing_source_ids)
+            except json.JSONDecodeError:
+                existing_source_ids = []
+        if not isinstance(existing_source_ids, list):
+            existing_source_ids = []
+        try:
+            existing_confidence = float(claim.get("confidence", 0.4) or 0.4)
+        except (TypeError, ValueError):
+            existing_confidence = 0.4
+        return self._json_failover(
+            prompt,
+            operation="qa_claim_repair",
+            validate=lambda payload: (
+                isinstance(payload.get("content", ""), str)
+                and isinstance(payload.get("source_ids", []), list)
+                and str(payload.get("status", "")) in {"reportable", "needs_review", "draft", "confirmed"}
+            ),
+            fallback_data={
+                "content": claim.get("content", ""),
+                "confidence": min(existing_confidence, 0.45),
+                "source_ids": existing_source_ids,
+                "needs_review": True,
+                "status": "needs_review",
+                "uncertainty": "DeepSeek 质检打回修复链路不可用，保留为待复核结论。",
+                "claim_type": "assumption",
+            },
+            fallback_tool="rules_qa_claim_repair",
+            fallback_reason="DeepSeek 质检打回修复链路不可用，保留待复核结论。",
         )
 
     def review_collection(self, task: dict[str, Any], sources: list[dict[str, Any]]) -> LLMJSONResult:
         prompt = build_collection_prompt(task, sources)
-        if self.provider != "doubao":
-            return LLMJSONResult(
-                provider="mock",
-                data={"summary": "mock collection review skipped", "covered_modules": [], "search_gaps": []},
-                input_tokens=estimate_tokens(prompt),
-                output_tokens=1,
-                used_fallback=True,
-                fallback_reason="未配置豆包，使用规则采集判断。",
-                tool_calls=[{"name": "mock_collection_review", "result": "skipped"}],
-            )
-        payload = self._chat_json(prompt, timeout=self.timeout_seconds)
-        if not isinstance(payload.get("summary", ""), str):
-            raise LLMProviderError("doubao collection schema validation failed")
-        return LLMJSONResult(
-            provider="doubao",
-            data=payload,
-            input_tokens=estimate_tokens(prompt),
-            output_tokens=estimate_tokens(json.dumps(payload, ensure_ascii=False)),
-            tool_calls=[{"name": "doubao_chat_completions", "result": "collection_review"}],
+        return self._json_failover(
+            prompt,
+            operation="collection_review",
+            validate=lambda payload: isinstance(payload.get("summary", ""), str),
+            fallback_data={"summary": "规则采集判断兜底", "covered_modules": [], "search_gaps": []},
+            fallback_tool="rules_collection_review",
+            fallback_reason="采集复核模型链路不可用，使用规则采集判断。",
         )
 
     def plan_collection_queries(self, task: dict[str, Any]) -> LLMJSONResult:
         prompt = build_collection_query_plan_prompt(task)
-        if self.provider != "doubao":
-            return LLMJSONResult(
-                provider="mock",
-                data={"summary": "mock query plan skipped", "queries": []},
-                input_tokens=estimate_tokens(prompt),
-                output_tokens=1,
-                used_fallback=True,
-                fallback_reason="未配置豆包，使用规则搜索计划。",
-                tool_calls=[{"name": "mock_collection_query_plan", "result": "skipped"}],
-            )
-        payload = self._chat_json(prompt, timeout=self.timeout_seconds)
-        if not isinstance(payload.get("queries", []), list):
-            raise LLMProviderError("doubao collection query plan schema validation failed")
-        return LLMJSONResult(
-            provider="doubao",
-            data=payload,
-            input_tokens=estimate_tokens(prompt),
-            output_tokens=estimate_tokens(json.dumps(payload, ensure_ascii=False)),
-            tool_calls=[{"name": "doubao_chat_completions", "result": "collection_query_plan"}],
+        return self._json_failover(
+            prompt,
+            operation="collection_query_plan",
+            validate=lambda payload: isinstance(payload.get("queries", []), list),
+            fallback_data={"summary": "规则搜索计划兜底", "queries": []},
+            fallback_tool="rules_collection_query_plan",
+            fallback_reason="搜索规划模型链路不可用，使用规则搜索计划。",
+        )
+
+    def interpret_manual_revision(
+        self,
+        task: dict[str, Any],
+        selected_text: str,
+        user_text: str,
+        claim: dict[str, Any] | None = None,
+    ) -> LLMJSONResult:
+        claim = claim or {}
+        competitors = [str(item) for item in task.get("competitors", []) if str(item).strip()]
+        prompt = (
+            "你是竞品分析系统的人工复核意图解析器。只输出 JSON。"
+            "任务：根据用户选中的报告段落和复核说明，判断要复核哪家竞品、什么事实、应如何补搜。"
+            "不要把用户原话改写成报告正文；只生成结构化复核计划。"
+            "输出字段："
+            '{"target_competitor":"...", "target_section":"overview|feature_tree|pricing_model|user_persona|reviews|swot", '
+            '"target_fact":"...", "expected_correction":"...", "requires_external_verification":true, '
+            '"search_queries":["..."], "confidence":0.0}'
+            f"\n竞品列表：{', '.join(competitors)}"
+            f"\n原 claim section：{claim.get('section', '')}"
+            f"\n原 claim content：{claim.get('content', '')}"
+            f"\n用户选中文本：{selected_text}"
+            f"\n用户复核说明：{user_text}"
+            "\n如果用户提到 ChatGPT、GPT、OpenAI、GPT-4o、GPT-5、GPT-5.5，target_competitor 应指向 ChatGPT/OpenAI 对应竞品，不要误判成豆包。"
+            "\n如果需要搜索，query 应优先包含官方、pricing、plans、release notes、订阅、定价等词。"
+        )
+        return self._json_failover(
+            prompt,
+            operation="manual_revision_intent",
+            validate=lambda payload: isinstance(payload.get("search_queries", []), list),
+            fallback_data={
+                "target_competitor": "",
+                "target_section": claim.get("section", ""),
+                "target_fact": "",
+                "expected_correction": "",
+                "requires_external_verification": True,
+                "search_queries": [],
+                "confidence": 0.0,
+            },
+            fallback_tool="rules_manual_revision_intent",
+            fallback_reason="人工复核意图解析模型链路不可用，使用规则解析。",
         )
 
     def plan_report_dimensions(self, task: dict[str, Any]) -> LLMJSONResult:
@@ -610,7 +757,7 @@ class LLMProvider:
                 fallback_reason=deepseek_error or "未配置豆包，使用本地问卷大纲模板。",
                 tool_calls=[{"name": "mock_questionnaire_design", "result": "local outline"}],
             )
-        payload = self._chat_json(prompt, timeout=self.timeout_seconds + 10)
+        payload = self._chat_json(prompt, timeout=self.timeout_seconds)
         if not isinstance(payload.get("sections"), list):
             raise LLMProviderError("doubao questionnaire design schema validation failed")
         return LLMJSONResult(
@@ -640,7 +787,7 @@ class LLMProvider:
                 fallback_reason="未配置豆包，跳过问卷分析。",
                 tool_calls=[{"name": "mock_survey_analysis", "result": "skipped"}],
             )
-        payload = self._chat_json(prompt, timeout=self.timeout_seconds + 15)
+        payload = self._chat_json(prompt, timeout=self.timeout_seconds)
         if not isinstance(payload.get("summary", ""), str):
             raise LLMProviderError("doubao survey analysis schema validation failed")
         return LLMJSONResult(
@@ -725,7 +872,7 @@ class LLMProvider:
                 fallback_reason=deepseek_error or "未配置豆包，使用本地访谈提纲模板。",
                 tool_calls=[{"name": "mock_interview_guide", "result": "local outline"}],
             )
-        payload = self._chat_json(prompt, timeout=self.timeout_seconds + 10)
+        payload = self._chat_json(prompt, timeout=self.timeout_seconds)
         if not isinstance(payload.get("phases"), list):
             raise LLMProviderError("doubao interview guide schema validation failed")
         return LLMJSONResult(
@@ -755,7 +902,7 @@ class LLMProvider:
                 fallback_reason="未配置豆包，跳过访谈提取。",
                 tool_calls=[{"name": "mock_interview_extraction", "result": "skipped"}],
             )
-        payload = self._chat_json(prompt, timeout=self.timeout_seconds + 20)
+        payload = self._chat_json(prompt, timeout=self.timeout_seconds)
         if not isinstance(payload.get("summary", ""), str):
             raise LLMProviderError("doubao interview extraction schema validation failed")
         return LLMJSONResult(
@@ -839,7 +986,74 @@ class LLMProvider:
             raise LLMProviderError("doubao response must be a JSON object")
         return parsed
 
-    def _deepseek_chat_json(self, prompt: str, timeout: int) -> dict[str, Any]:
+    def _json_provider_order(self) -> list[str]:
+        if self.configured_provider == "mock":
+            return []
+        order: list[str] = []
+        if self.deepseek_api_key and self.deepseek_model_id:
+            order.append("deepseek")
+        if self.zhipu_api_key and self.zhipu_model_id:
+            order.append("zhipu")
+        if self.api_key and self.model_id:
+            order.append("doubao")
+        return order
+
+    def _json_failover(
+        self,
+        prompt: str,
+        operation: str,
+        validate,
+        fallback_data: dict[str, Any],
+        fallback_tool: str,
+        fallback_reason: str,
+        timeout: int | None = None,
+    ) -> LLMJSONResult:
+        failures: list[dict[str, Any]] = []
+        for provider in self._json_provider_order():
+            try:
+                payload = self._chat_json_for_provider(provider, prompt, timeout or self._timeout_for_provider(provider))
+                if not validate(payload):
+                    raise LLMProviderError(f"{provider} {operation} schema validation failed")
+                tool_calls = failures + [{"name": f"{provider}_chat_completions", "result": operation}]
+                return LLMJSONResult(
+                    provider=provider,
+                    data=payload,
+                    input_tokens=estimate_tokens(prompt),
+                    output_tokens=estimate_tokens(json.dumps(payload, ensure_ascii=False)),
+                    fallback_reason="; ".join(call["error"] for call in failures),
+                    tool_calls=tool_calls,
+                )
+            except LLMProviderError as exc:
+                failures.append(
+                    {
+                        "name": "model_provider_failover",
+                        "provider": provider,
+                        "result": "failed",
+                        "operation": operation,
+                        "error": str(exc)[:240],
+                    }
+                )
+        reason = "; ".join(call["error"] for call in failures) or fallback_reason
+        return LLMJSONResult(
+            provider="mock",
+            data=fallback_data,
+            input_tokens=estimate_tokens(prompt),
+            output_tokens=1,
+            used_fallback=True,
+            fallback_reason=reason,
+            tool_calls=failures + [{"name": fallback_tool, "result": "fallback"}],
+        )
+
+    def _chat_json_for_provider(self, provider: str, prompt: str, timeout: int, require_object: bool = True) -> Any:
+        if provider == "deepseek":
+            return self._deepseek_chat_json(prompt, timeout=timeout, require_object=require_object)
+        if provider == "zhipu":
+            return self._zhipu_chat_json(prompt, timeout=timeout, require_object=require_object)
+        if provider == "doubao":
+            return self._chat_json(prompt, timeout=timeout)
+        raise LLMProviderError(f"unsupported JSON provider: {provider}")
+
+    def _deepseek_chat_json(self, prompt: str, timeout: int, require_object: bool = True) -> Any:
         if not self.deepseek_api_key:
             raise LLMProviderError("DEEPSEEK_API_KEY is not configured")
         if not self.deepseek_model_id:
@@ -877,8 +1091,50 @@ class LLMProvider:
             parsed = extract_json_payload(content)
         except json.JSONDecodeError as exc:
             raise LLMProviderError("deepseek JSON parse failed") from exc
-        if not isinstance(parsed, dict):
+        if require_object and not isinstance(parsed, dict):
             raise LLMProviderError("deepseek response must be a JSON object")
+        return parsed
+
+    def _zhipu_chat_json(self, prompt: str, timeout: int, require_object: bool = True) -> Any:
+        if not self.zhipu_api_key:
+            raise LLMProviderError("ZHIPU_API_KEY is not configured")
+        if not self.zhipu_model_id:
+            raise LLMProviderError("ZHIPU_MODEL is not configured")
+        request_body = {
+            "model": self.zhipu_model_id,
+            "messages": [
+                {"role": "system", "content": "你只输出合法 JSON 对象，不输出 Markdown 或额外解释。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
+        request = urllib.request.Request(
+            f"{self.zhipu_base_url}/chat/completions",
+            data=json.dumps(request_body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.zhipu_api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            raise LLMProviderError(f"zhipu HTTP {exc.code}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise LLMProviderError("zhipu timeout") from exc
+        except urllib.error.URLError as exc:
+            raise LLMProviderError(f"zhipu network error: {exc.reason}") from exc
+        except OSError as exc:
+            raise LLMProviderError(f"zhipu connection error: {exc.__class__.__name__}") from exc
+        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        try:
+            parsed = extract_json_payload(content)
+        except json.JSONDecodeError as exc:
+            raise LLMProviderError("zhipu JSON parse failed") from exc
+        if require_object and not isinstance(parsed, dict):
+            raise LLMProviderError("zhipu response must be a JSON object")
         return parsed
 
     def _generate_with_doubao(self, prompt: str, evidence: list[dict[str, Any]]) -> LLMResult:

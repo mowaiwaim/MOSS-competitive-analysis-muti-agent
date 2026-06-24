@@ -1194,7 +1194,9 @@ def test_log_filters_and_download_zip(client):
     with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
         names = set(archive.namelist())
         assert {"agent_runs.jsonl", "agent_runs.csv"} <= names
-        assert "质检 Agent" in archive.read("agent_runs.csv").decode("utf-8")
+        csv_payload = archive.read("agent_runs.csv")
+        assert csv_payload.startswith(b"\xef\xbb\xbf")
+        assert "质检 Agent" in csv_payload.decode("utf-8-sig")
 
 
 def test_archive_and_delete_history_tasks(client):
@@ -1218,6 +1220,21 @@ def test_archive_and_delete_history_tasks(client):
     assert client.get(f"/api/tasks/{task_to_delete['id']}").status_code == 404
 
 
+def test_5019_startup_uses_separate_clean_database(tmp_path):
+    ps1 = (ROOT / "启动_5019.ps1").read_text(encoding="utf-8")
+    bat = (ROOT / "启动_5019.bat").read_text(encoding="utf-8")
+    assert "5019" in ps1
+    assert "app_5019_clean.db" in ps1
+    assert "MOSS_DATABASE" in ps1
+    assert "5019" in bat
+    assert "app_5019_clean.db" in bat
+    assert "MOSS_DATABASE" in bat
+
+    clean_db = tmp_path / "app_5019_clean.db"
+    app = create_app({"TESTING": True, "DATABASE": str(clean_db), "WORKFLOW_ASYNC": False})
+    assert app.test_client().get("/api/tasks").get_json() == []
+
+
 def test_doubao_key_is_read_from_env_but_not_leaked(tmp_path, monkeypatch):
     dummy_key = "test-key"
     monkeypatch.setenv("LLM_PROVIDER", "doubao")
@@ -1229,7 +1246,6 @@ def test_doubao_key_is_read_from_env_but_not_leaked(tmp_path, monkeypatch):
     task = create_demo_task(test_client)
     logs = test_client.get(f"/api/tasks/{task['id']}/logs").get_json()
     serialized = str(logs)
-    assert "DOUBAO_ENDPOINT_ID is not configured" in serialized
     assert dummy_key not in serialized
 
     response = test_client.get(f"/api/tasks/{task['id']}/logs/download")
@@ -1302,6 +1318,54 @@ def test_doubao_provider_accepts_schema_valid_response(monkeypatch):
     assert result.claims[0]["source_ids"] == ["src1"]
 
 
+def test_generate_claims_prefers_deepseek_before_doubao(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-test")
+    monkeypatch.setenv("DOUBAO_API_KEY", "doubao-test-key")
+    monkeypatch.setenv("DOUBAO_ENDPOINT_ID", "ep-test")
+    calls = []
+
+    class FakeResponse:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            payload = {
+                "claims": [
+                    {
+                        "section": "overview",
+                        "content": "ChatGPT has evidence-bound productivity claims",
+                        "confidence": 0.82,
+                        "source_ids": ["src1"],
+                        "needs_review": False,
+                        "status": "reportable",
+                        "uncertainty": "",
+                    }
+                ]
+            }
+            return json.dumps({"choices": [{"message": {"content": json.dumps(payload)}}]}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append((request.full_url, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    result = LLMProvider().generate_claims(
+        {"industry": "AI", "competitors": ["ChatGPT"], "focus_areas": ["功能对比"]},
+        [{"source_id": "src1", "chunk_index": 0, "source_title": "source", "excerpt": "evidence"}],
+    )
+
+    assert result.provider == "deepseek"
+    assert result.claims[0]["source_ids"] == ["src1"]
+    assert calls == [("https://api.deepseek.com/chat/completions", 300)]
+
+
 def test_research_questionnaire_uses_deepseek_before_doubao(monkeypatch):
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
@@ -1328,7 +1392,7 @@ def test_research_questionnaire_uses_deepseek_before_doubao(monkeypatch):
             return json.dumps({"choices": [{"message": {"content": json.dumps(response_payload, ensure_ascii=False)}}]}).encode("utf-8")
 
     def fake_urlopen(request, timeout):
-        calls.append({"url": request.full_url, "body": json.loads(request.data.decode("utf-8")), "auth": request.headers["Authorization"]})
+        calls.append({"url": request.full_url, "body": json.loads(request.data.decode("utf-8")), "auth": request.headers["Authorization"], "timeout": timeout})
         return FakeResponse()
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
@@ -1343,6 +1407,7 @@ def test_research_questionnaire_uses_deepseek_before_doubao(monkeypatch):
     assert calls[0]["url"] == "https://api.deepseek.com/chat/completions"
     assert calls[0]["body"]["model"] == "deepseek-test"
     assert calls[0]["auth"] == "Bearer deepseek-test-key"
+    assert calls[0]["timeout"] == 300
 
 
 def test_research_interview_guide_uses_deepseek(monkeypatch):
@@ -1408,6 +1473,105 @@ def test_research_deepseek_failure_falls_back_to_local_template(monkeypatch):
     assert result.data["sections"]
 
 
+def test_research_timeout_is_five_minutes(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_RESEARCH_TIMEOUT_SECONDS", "999")
+    provider = LLMProvider()
+    assert provider.deepseek_timeout_seconds == 300
+    assert provider.timeout_seconds == 600
+
+
+def test_qa_review_provider_order_deepseek_zhipu_doubao(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-test")
+    monkeypatch.setenv("ZHIPU_API_KEY", "zhipu-key")
+    monkeypatch.setenv("ZHIPU_MODEL", "glm-test")
+    monkeypatch.setenv("DOUBAO_API_KEY", "doubao-key")
+    monkeypatch.setenv("DOUBAO_ENDPOINT_ID", "ep-test")
+    calls = []
+    timeouts = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": json.dumps(self.payload, ensure_ascii=False)}}]}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append(request.full_url)
+        timeouts.append(timeout)
+        if "api.deepseek.com" in request.full_url:
+            raise TimeoutError("deepseek slow")
+        return FakeResponse({"passed": True, "findings": [], "summary": "ok"})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    result = LLMProvider().review_claims(
+        {"industry": "AI", "competitors": ["ChatGPT"]},
+        [{"section": "overview", "content": "ChatGPT 有来源结论", "source_ids": ["s1"], "confidence": 0.8}],
+        [{"source_id": "s1", "excerpt": "source"}],
+    )
+
+    assert result.provider == "zhipu"
+    assert any(call["provider"] == "deepseek" and call["result"] == "failed" for call in result.tool_calls)
+    assert result.tool_calls[-1]["name"] == "zhipu_chat_completions"
+    assert calls[0] == "https://api.deepseek.com/chat/completions"
+    assert calls[1] == "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    assert timeouts[:2] == [300, 600]
+
+
+def test_qa_repair_claim_uses_deepseek(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-test")
+    calls = []
+    response_payload = {
+        "content": "ChatGPT 的修复后结论仅基于 OpenAI 官方来源表述，并保留价格口径复核提示。",
+        "confidence": 0.82,
+        "source_ids": ["src1"],
+        "needs_review": False,
+        "status": "reportable",
+        "uncertainty": "",
+        "claim_type": "fact",
+    }
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": json.dumps(response_payload, ensure_ascii=False)}}]}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append({"url": request.full_url, "timeout": timeout, "body": json.loads(request.data.decode("utf-8"))})
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    result = LLMProvider().repair_claim_after_qa(
+        {"industry": "AI", "competitors": ["ChatGPT"], "focus_areas": ["定价"]},
+        {"id": "claim-1", "section": "pricing_model", "content": "原结论", "confidence": 0.6, "source_ids": ["src1"]},
+        {"reason": "价格缺少官方来源", "finding_type": "pricing_missing_official"},
+        [{"source_id": "src1", "source_title": "OpenAI pricing", "excerpt": "official pricing evidence"}],
+    )
+
+    assert result.provider == "deepseek"
+    assert result.data["source_ids"] == ["src1"]
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://api.deepseek.com/chat/completions"
+    assert calls[0]["timeout"] == 300
+    assert calls[0]["body"]["model"] == "deepseek-test"
+    assert "质检打回修复 Agent" in calls[0]["body"]["messages"][0]["content"] + calls[0]["body"]["messages"][1]["content"]
+
+
 def test_manual_action_generates_new_report_version(client):
     task = create_demo_task(client)
     response = client.post(
@@ -1452,8 +1616,10 @@ def test_context_menu_revision_updates_selected_report_text(client):
     refreshed_report = client.get(f"/api/tasks/{task['id']}/report").get_json()
     assert refreshed_report["version"] > initial_report["version"]
     report_text = json.dumps(refreshed_report["content"], ensure_ascii=False)
-    assert "人工修正待复核" in report_text
-    assert "重新搜索补证" in report_text
+    assert "人工修正待复核" not in report_text
+    assert "人工要求修正" not in report_text
+    assert "用户说" not in report_text
+    assert "待核验" in report_text or "核验" in report_text
 
     task_payload = client.get(f"/api/tasks/{task['id']}").get_json()
     actions = task_payload["manual_actions"]
@@ -1462,8 +1628,47 @@ def test_context_menu_revision_updates_selected_report_text(client):
     revision_findings = [finding for finding in task_payload["qa_findings"] if finding["finding_type"] == "manual_revision"]
     assert revision_findings
     assert revision_findings[-1]["manual_review_state"] in {"awaiting_recheck", "system_rechecked", "needs_more_input"}
+    assert revision_findings[-1]["meta"]["revision_intent"]["target_competitor"]
     sources = client.get(f"/api/tasks/{task['id']}/sources").get_json()
     assert any(source["source_type"] == "manual_input" and "人工修正" in source["title"] for source in sources)
+
+
+def test_manual_revision_gpt_version_targets_chatgpt_not_doubao(client):
+    response = client.post(
+        "/api/tasks",
+        json={
+            "industry": "AI 大模型与智能助手",
+            "competitors": ["ChatGPT", "DeepSeek", "豆包"],
+            "websites": ["https://openai.com/", "https://www.deepseek.com/", "https://www.doubao.com/"],
+            "focus_areas": ["功能对比", "定价", "用户评价", "SWOT"],
+            "source_mode": "缓存样例",
+        },
+    )
+    assert response.status_code == 201
+    task = response.get_json()
+    selected_text = "ChatGPT 当前主打 GPT-4o，并提供订阅方案。"
+    response = client.post(
+        f"/api/tasks/{task['id']}/manual-actions",
+        json={
+            "action": "revise_claim",
+            "user_text": "现在是 GPT-5.5 吧，请看官方定价以及订阅界面的说明。",
+            "selected_text": selected_text,
+        },
+    )
+
+    assert response.status_code == 201
+    task_payload = client.get(f"/api/tasks/{task['id']}").get_json()
+    revision_findings = [finding for finding in task_payload["qa_findings"] if finding["finding_type"] == "manual_revision"]
+    assert revision_findings
+    intent = revision_findings[-1]["meta"]["revision_intent"]
+    assert intent["target_competitor"] == "ChatGPT"
+    assert "豆包" not in "".join(intent.get("search_queries", []))
+    assert any("OpenAI" in query or "ChatGPT" in query for query in intent.get("search_queries", []))
+
+    report_text = json.dumps(client.get(f"/api/tasks/{task['id']}/report").get_json()["content"], ensure_ascii=False)
+    assert "现在是 GPT-5.5" not in report_text
+    assert "请看官方" not in report_text
+    assert "人工修正待复核" not in report_text
 
 
 def test_manual_confirmation_updates_exact_claim(client):
@@ -2333,7 +2538,7 @@ def test_react_deep_analysis_belongs_to_analysis_agent(client, monkeypatch):
         assert row.get("evidence_refs") or row.get("section_refs") or row.get("status") in {"NA", "价格证据不足"} or has_formula_basis
 
 
-def test_manual_source_refreshes_deep_analysis_before_report(client, monkeypatch):
+def test_manual_source_patches_existing_report_without_full_react_refresh(client, monkeypatch):
     calls = []
 
     def fake_run_react_report(task, sources, claims, output_dir):
@@ -2373,12 +2578,15 @@ def test_manual_source_refreshes_deep_analysis_before_report(client, monkeypatch
 
     assert response.status_code == 201
     assert response.get_json()["interpreted_intent"] == "supplement_source"
-    assert len(calls) >= initial_calls + 1
+    assert len(calls) == initial_calls
     logs = client.get(f"/api/tasks/{task['id']}/logs").get_json()
     analysis_logs = [log for log in logs if log["agent_name"] == "分析 Agent"]
     report_logs = [log for log in logs if log["agent_name"] == "报告 Agent"]
-    assert any("refresh_analysis_artifact" in str(log["tool_calls"]) for log in analysis_logs)
+    assert not any("refresh_analysis_artifact" in str(log["tool_calls"]) for log in analysis_logs)
     assert "fake_manual_refresh" not in str(report_logs[-1]["tool_calls"])
+    report_text = json.dumps(client.get(f"/api/tasks/{task['id']}/report").get_json()["content"], ensure_ascii=False)
+    assert "https://example.com/product" in report_text
+    assert "人工复核" in report_text
 
 
 def test_report_frontend_uses_linked_toc_and_app_market_visual_panel():
@@ -2458,6 +2666,10 @@ def test_report_frontend_uses_linked_toc_and_app_market_visual_panel():
     assert "$(\"#manualSubmitButton\").addEventListener(\"click\"" in js
     assert "submitManualTextForTask" in js
     assert "repairQaFindingForTask" in js
+    assert "renderLogTokenSummary(logs)" in js
+    assert "function renderLogTokenSummary" in js
+    assert 'id="downloadLogsButton" type="button">下载</button>' in (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+    assert 'id="logTokenSummary"' in (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
     assert "backgroundTask.finally" in manual_form_block
     assert "const findingId = state.manualFindingId" in manual_form_block
     assert "closeManualModal();" in manual_form_block
@@ -2610,7 +2822,7 @@ def test_analysis_artifact_preserves_markdown_and_marks_unsupported_terms():
     markdown = "# 竞品调研报告：测试\n\n## 一、报告概述（Executive Summary）\n### 1.1 核心发现\nChatGPT 的 GPT-5.5 系列模型能力领先。\n\n## 二、市场与赛道分析（Market Context）\n2026 年市场规模预计 680 亿元。"
     assert "\n### 1.1 核心发现\n" in sanitize_markdown_text(markdown)
     footer = sanitize_markdown_text("*本报告由竞争情报分析师基于公开信息编制，仅供参考，不构成投资建议。*")
-    assert "MOSS团队" in footer
+    assert "MOSS团队小莫" in footer
     assert "竞争情报分析师" not in footer
 
     orch = object.__new__(Orchestrator)
@@ -2641,13 +2853,16 @@ def test_full_report_has_manual_and_recheck_actions():
 def test_board_summary_removed_and_markdown_bullets_render_as_tables():
     js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
     board_block = js[js.index("function renderBoard") : js.index("function renderInlinePlanFromDag")]
+    node_events_block = js[js.index("function renderNodeEvents") : js.index("function editCurrentTaskAsNew")]
     assert "board-summary" not in board_block
     assert "canvas.replaceChildren(stages)" in board_block
+    assert ".slice(-5)" not in node_events_block
     assert "人工复核工作台" in js
     assert "质检发现问题，已进入人工复核工作台" in js
     assert "复核处理中" in js
     assert "cleanMarkdownLinkLabel" in js
     assert "isEvidenceStyleLinkLabel" in js
+    assert "local_repair_rules" in js
     assert 'className: "bullet-table"' in js
     assert 'show("#reportView")' in js
     assert 'state.task && state.task.status === "completed"' in js
@@ -2656,6 +2871,9 @@ def test_board_summary_removed_and_markdown_bullets_render_as_tables():
     css = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
     assert ".markdown-report .bullet-table" in css
     assert "tr:nth-child(odd)" in css
+    node_events_css = css[css.index(".node-events") : css.index(".node-events li")]
+    assert "max-height: 260px" in node_events_css
+    assert "overflow-y: auto" in node_events_css
 
 
 def test_provider_status_reports_provider_timeouts(tmp_path, monkeypatch):
@@ -2672,9 +2890,9 @@ def test_provider_status_reports_provider_timeouts(tmp_path, monkeypatch):
     app = create_app({"TESTING": True, "DATABASE": str(tmp_path / "provider.db"), "WORKFLOW_ASYNC": False})
     payload = app.test_client().get("/api/provider-status").get_json()["react_report"]
     assert payload["configured_provider"] == "deepseek-react"
-    assert payload["react_timeout_seconds"]["deepseek-react"] == 900
+    assert payload["react_timeout_seconds"]["deepseek-react"] == 300
     assert payload["react_timeout_seconds"]["zhipu-react"] == 600
-    assert payload["react_timeout_seconds"]["doubao-react"] == 450
+    assert payload["react_timeout_seconds"]["doubao-react"] == 600
     assert [item["provider"] for item in payload["preferred_order"]][:3] == ["deepseek-react", "zhipu-react", "doubao-react"]
 
 
@@ -2854,6 +3072,92 @@ def test_failover_diagnostics_keeps_zhipu_filter_context():
     assert diagnostics[-1]["name"] == "react_provider_failover_diagnostics"
 
 
+def test_manual_report_patch_updates_only_selected_table_row(tmp_path):
+    db_path = tmp_path / "manual-table-patch.db"
+    create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
+    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    task_id = "manual-table-task"
+    sections = [
+        {"key": "react_1", "title": "第一章 概览", "body": "第一章稳定内容。", "markdown": "第一章稳定内容。"},
+        {
+            "key": "react_5",
+            "title": "第五章 商业模式",
+            "body": (
+                "第五章说明。\n\n"
+                "### 5.4 商业模式对比\n\n"
+                "| 维度 | 竞品A | 竞品B |\n"
+                "| --- | --- | --- |\n"
+                "| 价格 | 订阅制 | 按量计费 |\n"
+                "| 功能 | A | B |\n"
+            ),
+            "markdown": (
+                "第五章说明。\n\n"
+                "### 5.4 商业模式对比\n\n"
+                "| 维度 | 竞品A | 竞品B |\n"
+                "| --- | --- | --- |\n"
+                "| 价格 | 订阅制 | 按量计费 |\n"
+                "| 功能 | A | B |\n"
+            ),
+        },
+        {"key": "react_6", "title": "第六章 增长策略", "body": "第六章稳定内容。", "markdown": "第六章稳定内容。"},
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, industry, competitors_json, websites_json, focus_areas_json, source_mode, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, "manual table", "AI", "[]", "[]", "[]", "缓存样例", "completed", utc_now_iso()),
+        )
+    assert orch._save_analysis_artifact(
+        task_id,
+        {
+            "provider": "deepseek-react",
+            "analysis_markdown": "\n\n".join(f"## {section['title']}\n\n{section['markdown']}" for section in sections),
+            "sections": sections,
+            "tool_calls": [{"name": "initial_full_report", "result": "ok"}],
+        },
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO reports
+            (id, task_id, version, title, content_json, generated_at, citation_map, qa_status, confidence_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "report-1",
+                task_id,
+                1,
+                "AI竞品分析报告",
+                json.dumps({"react_report": {"sections": sections}, "display_sections": sections}, ensure_ascii=False),
+                utc_now_iso(),
+                "{}",
+                "passed",
+                0.8,
+            ),
+        )
+
+    selected_row = "| 价格 | 订阅制 | 按量计费 |"
+    assert orch._patch_latest_analysis_artifact_for_manual_revision(
+        task_id,
+        selected_row,
+        "质疑第五章表格中的价格行。",
+        "manual-source",
+        claim_id="claim-1",
+        replacement_text="该价格行已被人工质疑，需重新核验：https://example.com/source",
+        patch_reason="manual_dispute",
+    )
+
+    artifact = orch._latest_analysis_artifact(task_id)
+    patched_sections = artifact["sections"]
+    assert patched_sections[0]["markdown"] == sections[0]["markdown"]
+    assert patched_sections[2]["markdown"] == sections[2]["markdown"]
+    patched_table = patched_sections[1]["markdown"]
+    assert selected_row not in patched_table
+    assert "| 功能 | A | B |" in patched_table
+    assert "人工复核" in patched_table
+    assert "https://example.com/source" in patched_table
+    assert any(call.get("reason") == "manual_dispute" for call in artifact["tool_calls"])
+
+
 def test_short_react_refresh_does_not_replace_richer_artifact(tmp_path, monkeypatch):
     monkeypatch.setenv("REACT_ARTIFACT_REPLACE_MIN_RATIO", "0.85")
     db_path = tmp_path / "artifact-protect.db"
@@ -2903,6 +3207,125 @@ def test_repeated_qa_failure_handoff_is_manual_pending(tmp_path):
     assert row[0] == "qa_passed"
     assert finding[0] == "manual_pending"
     assert finding[1]
+
+
+def test_qa_max_round_handoff_even_when_failure_signature_changes(tmp_path, monkeypatch):
+    db_path = tmp_path / "manual-pending-max-rounds.db"
+    create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
+    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    task_id = "qa-max-round-task"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, industry, competitors_json, websites_json, focus_areas_json, source_mode, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, "qa-max-round", "AI", "[]", "[]", "[]", "缂撳瓨鏍蜂緥", "qa_rework", utc_now_iso()),
+        )
+
+    monkeypatch.setattr(orch, "_qa_check", lambda task_id, first_pass=False, rework_round=0: "claim-changing")
+    monkeypatch.setattr(orch, "_primary_open_finding_signature", lambda task_id, claim_id="": "changed-signature")
+
+    result = orch._workflow_qa_review_node(
+        {
+            "task_id": task_id,
+            "qa_round": 2,
+            "last_failure_signature": "previous-signature",
+            "repeated_failure_count": 1,
+            "deep_refresh_needed": False,
+        }
+    )
+    handoff = orch._workflow_manual_handoff_node({**result, "task_id": task_id, "qa_round": 2})
+
+    assert result["next_node"] == "manual_handoff"
+    assert result["workflow_trace"][0]["result"] == "manual_handoff_max_rounds"
+    assert result["workflow_trace"][0]["max_auto_qa_rounds"] == 3
+    assert handoff["next_node"] == "report"
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row[0] == "qa_passed"
+
+
+def test_qa_rework_analysis_logs_deepseek_repair_provider(tmp_path, monkeypatch):
+    db_path = tmp_path / "deepseek-repair.db"
+    create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
+    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    task_id = "deepseek-repair-task"
+    now = utc_now_iso()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, name, industry, competitors_json, websites_json, focus_areas_json, source_mode, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, "deepseek repair", "AI", json.dumps(["ChatGPT"], ensure_ascii=False), "[]", json.dumps(["定价"], ensure_ascii=False), "实时采集", "qa_rework", now),
+        )
+        conn.execute(
+            """
+            INSERT INTO sources
+            (id, task_id, source_type, title, url_or_path, author_site, collected_at, credibility, excerpt, competitor_name, source_role)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("src1", task_id, "official_site", "OpenAI pricing", "https://openai.com/pricing", "openai.com", now, "high", "official pricing evidence", "ChatGPT", "official_pricing"),
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_chunks
+            (id, task_id, source_id, chunk_index, char_start, char_end, summary, excerpt, collected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("chunk1", task_id, "src1", 0, 0, 80, "official pricing", "official pricing evidence", now),
+        )
+        conn.execute(
+            """
+            INSERT INTO claims
+            (id, task_id, section, content, confidence, source_ids, generated_agent, needs_review, status, uncertainty, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("claim1", task_id, "pricing_model", "原始价格结论缺少来源。", 0.6, json.dumps(["src1"], ensure_ascii=False), "分析 Agent", 1, "needs_review", "待复核", now),
+        )
+        conn.execute(
+            """
+            INSERT INTO qa_findings
+            (id, task_id, claim_id, severity, reason, target_agent, finding_type, action_hint, meta_json, fix_status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("finding1", task_id, "claim1", "high", "价格缺少官方来源", "分析 Agent", "pricing_missing_official", "调用模型修复", "{}", "open", now),
+        )
+
+    calls = []
+
+    def fake_repair(task, claim, finding, evidence):
+        calls.append({"claim": claim, "finding": finding, "evidence": evidence})
+        return SimpleNamespace(
+            provider="deepseek",
+            data={
+                "content": "ChatGPT 的价格结论已按 OpenAI 官方来源修复。",
+                "confidence": 0.84,
+                "source_ids": ["src1"],
+                "needs_review": False,
+                "status": "reportable",
+                "uncertainty": "",
+                "claim_type": "fact",
+            },
+            input_tokens=123,
+            output_tokens=45,
+            fallback_reason="",
+            tool_calls=[{"name": "deepseek_chat_completions", "result": "qa_claim_repair"}],
+        )
+
+    monkeypatch.setattr(orch.llm_provider, "repair_claim_after_qa", fake_repair)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        claim = conn.execute("SELECT * FROM claims WHERE id = 'claim1'").fetchone()
+        finding = conn.execute("SELECT * FROM qa_findings WHERE id = 'finding1'").fetchone()
+
+    result = orch._repair_claim_with_deepseek(task_id, finding, claim, ["ChatGPT"])
+
+    assert result["updated"] is True
+    assert calls and calls[0]["evidence"]
+    with sqlite3.connect(db_path) as conn:
+        claim_row = conn.execute("SELECT content, status, needs_review FROM claims WHERE id = 'claim1'").fetchone()
+        log_row = conn.execute("SELECT model_provider, tool_calls FROM agent_runs WHERE task_id = ? AND agent_name = '分析 Agent' ORDER BY rowid DESC LIMIT 1", (task_id,)).fetchone()
+    assert "OpenAI 官方来源修复" in claim_row[0]
+    assert claim_row[1] == "reportable"
+    assert claim_row[2] == 0
+    assert log_row[0] == "deepseek"
+    assert "repair_qa_finding_with_model" in log_row[1]
 
 
 def test_manual_recheck_is_guarded_while_workflow_active(tmp_path):

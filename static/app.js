@@ -516,10 +516,13 @@ function providerLabel(value = "") {
   }
   return {
     doubao: "豆包大模型",
+    deepseek: "DeepSeek",
+    zhipu: "智谱",
     "doubao-react": "豆包 ReAct 深度分析",
     "deepseek-react": "DeepSeek ReAct 深度分析",
     "zhipu-react": "智谱深度分析",
     "local-react-fallback": "本地深度分析备用规则",
+    local_repair_rules: "本地规则修复",
     "report-renderer": "报告排版生成",
     mock: "规则模式",
     volc_search: "火山联网搜索",
@@ -859,7 +862,7 @@ async function confirmDeleteTask() {
 }
 
 function renderNodeEvents(node) {
-  const events = (node.events || []).slice(-5);
+  const events = node.events || [];
   if (!events.length) {
     return el("ul", { className: "node-events" }, [
       el("li", {}, [
@@ -1226,6 +1229,7 @@ async function renderLogs() {
   if (!state.task) return;
   const path = buildLogPath("logs");
   const logs = await api(path);
+  renderLogTokenSummary(logs);
   $("#logList").replaceChildren(
     ...logs.map((log) =>
       el("article", { className: "log-entry" }, [
@@ -1242,6 +1246,22 @@ async function renderLogs() {
         el("p", { text: log.error ? `错误：${log.error}` : "错误：无" }),
       ]),
     ),
+  );
+}
+
+function renderLogTokenSummary(logs = []) {
+  const totalInput = logs.reduce((sum, log) => sum + Number(log.token_input || 0), 0);
+  const totalOutput = logs.reduce((sum, log) => sum + Number(log.token_output || 0), 0);
+  const providers = [...new Set(logs.map((log) => providerLabel(log.model_provider)).filter(Boolean))];
+  const reworkCount = logs.filter((log) => log.has_rework || ["rejected", "rerun_completed"].includes(log.status)).length;
+  const summary = $("#logTokenSummary");
+  if (!summary) return;
+  summary.replaceChildren(
+    el("span", {}, [el("strong", { text: String(totalInput) }), document.createTextNode(" 输入 token")]),
+    el("span", {}, [el("strong", { text: String(totalOutput) }), document.createTextNode(" 输出 token")]),
+    el("span", {}, [el("strong", { text: String(totalInput + totalOutput) }), document.createTextNode(" 总 token")]),
+    el("span", {}, [el("strong", { text: String(reworkCount) }), document.createTextNode(" 重跑/打回")]),
+    el("span", { text: `模型：${providers.join("、") || "规则/本地"}` }),
   );
 }
 
@@ -2443,7 +2463,7 @@ function isMarkdownTableSeparator(cells) {
 }
 
 function normalizeMarkdownText(markdown) {
-  let text = String(markdown || "").replace(/竞争情报分析师/g, "MOSS团队").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  let text = String(markdown || "").replace(/竞争情报分析师/g, "MOSS团队小莫").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
   if (!text) return "";
   text = text
     .replace(/\s+(#{3,5}\s+)/g, "\n\n$1")

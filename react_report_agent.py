@@ -293,13 +293,13 @@ def _read_int_env(name: str, default: int, minimum: int = 60, maximum: int = 180
 
 
 def _provider_timeout_seconds(provider_name: str) -> int:
-    fallback = _read_int_env("REACT_AGENT_MAX_SECONDS", 600)
+    fallback = _read_int_env("REACT_AGENT_MAX_SECONDS", 600, minimum=600, maximum=600)
     if provider_name == "deepseek-react":
-        return _read_int_env("DEEPSEEK_REACT_MAX_SECONDS", 900, maximum=2400)
+        return _read_int_env("DEEPSEEK_REACT_MAX_SECONDS", 300, minimum=60, maximum=300)
     if provider_name == "zhipu-react":
-        return _read_int_env("ZHIPU_REACT_MAX_SECONDS", 600, maximum=1800)
+        return _read_int_env("ZHIPU_REACT_MAX_SECONDS", 600, minimum=600, maximum=600)
     if provider_name == "doubao-react":
-        return _read_int_env("DOUBAO_REACT_MAX_SECONDS", 450, maximum=1800)
+        return _read_int_env("DOUBAO_REACT_MAX_SECONDS", 600, minimum=600, maximum=600)
     return fallback
 
 
@@ -398,7 +398,7 @@ def react_provider_status() -> dict[str, Any]:
         "strict_provider": _strict_provider_from_env(),
         "preferred_order": [_provider_public(item) for item in providers],
         "react_timeout_seconds": {
-            "default": _read_int_env("REACT_AGENT_MAX_SECONDS", 600),
+            "default": _read_int_env("REACT_AGENT_MAX_SECONDS", 600, minimum=600, maximum=600),
             "deepseek-react": _provider_timeout_seconds("deepseek-react"),
             "zhipu-react": _provider_timeout_seconds("zhipu-react"),
             "doubao-react": _provider_timeout_seconds("doubao-react"),

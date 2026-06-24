@@ -70,7 +70,7 @@ FONT_REGULAR, FONT_BOLD = _register_fonts()
 
 
 def _clean(value: Any, limit: int = 1600) -> str:
-    text = str(value or "").replace("竞争情报分析师", "MOSS团队").replace("\x00", " ")
+    text = str(value or "").replace("竞争情报分析师", "MOSS团队小莫").replace("\x00", " ")
     text = " ".join(text.split())
     if len(text) > limit:
         text = text[: max(0, limit - 1)] + "…"
@@ -78,7 +78,7 @@ def _clean(value: Any, limit: int = 1600) -> str:
 
 
 def _raw(value: Any, limit: int = 1600) -> str:
-    text = str(value or "").replace("竞争情报分析师", "MOSS团队").replace("\x00", " ")
+    text = str(value or "").replace("竞争情报分析师", "MOSS团队小莫").replace("\x00", " ")
     text = " ".join(text.split())
     if len(text) > limit:
         text = text[: max(0, limit - 1)] + "…"

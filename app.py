@@ -101,6 +101,10 @@ def load_local_env(path: Path) -> None:
         "DEEPSEEK_MODEL",
         "DEEPSEEK_THINKING_TYPE",
         "DEEPSEEK_DIRECT_THINKING_MODE",
+        "DEEPSEEK_RESEARCH_TIMEOUT_SECONDS",
+        "ZHIPU_BASE_URL",
+        "ZHIPU_API_KEY",
+        "ZHIPU_MODEL",
         "REACT_REPORT_ENABLED",
         "REACT_AGENT_PROVIDER",
         "REACT_AGENT_TEMPERATURE",
@@ -108,6 +112,7 @@ def load_local_env(path: Path) -> None:
         "REACT_AGENT_RECURSION_LIMIT",
         "REACT_AGENT_MAX_SECONDS",
         "DEEPSEEK_REACT_MAX_SECONDS",
+        "ZHIPU_REACT_MAX_SECONDS",
         "DOUBAO_REACT_MAX_SECONDS",
         "REACT_ARTIFACT_REPLACE_MIN_RATIO",
         "VOLC_SEARCH_API_KEY",
@@ -2255,7 +2260,7 @@ def build_logs_zip(task_id: str, logs: list[dict[str, Any]]):
             row = dict(log)
             row["tool_calls"] = dumps(row.get("tool_calls", []))
             writer.writerow(row)
-        archive.writestr("agent_runs.csv", csv_buffer.getvalue())
+        archive.writestr("agent_runs.csv", csv_buffer.getvalue().encode("utf-8-sig"))
     buffer.seek(0)
     return send_file(
         buffer,
