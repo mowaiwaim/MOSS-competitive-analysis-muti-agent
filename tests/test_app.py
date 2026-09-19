@@ -478,7 +478,7 @@ def test_report_schema_validation_blocks_report_insert(tmp_path, monkeypatch):
     app = create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
     test_client = app.test_client()
     task = create_demo_task(test_client)
-    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    orch = Orchestrator(db_path, ROOT / "examples" / "demo_dataset.json")
 
     with sqlite3.connect(db_path) as conn:
         before = conn.execute("SELECT COUNT(*) FROM reports WHERE task_id = ?", (task["id"],)).fetchone()[0]
@@ -997,7 +997,7 @@ def test_realtime_search_keeps_category_comparison_results(tmp_path, monkeypatch
 
 def test_ai_products_are_not_classified_as_category(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
-    orchestrator = Orchestrator(tmp_path / "object-type.db", ROOT / "data" / "demo_dataset.json")
+    orchestrator = Orchestrator(tmp_path / "object-type.db", ROOT / "examples" / "demo_dataset.json")
     assert orchestrator._analysis_object_type("ChatGPT", "AI 大模型与智能助手") == "product"
     assert orchestrator._analysis_object_type("DeepSeek", "AI 大模型与智能助手") == "product"
     assert orchestrator._analysis_object_type("酱香型白酒", "白酒品类") == "category"
@@ -1005,7 +1005,7 @@ def test_ai_products_are_not_classified_as_category(tmp_path, monkeypatch):
 
 def test_product_search_requires_competitor_identity(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
-    orchestrator = Orchestrator(tmp_path / "identity.db", ROOT / "data" / "demo_dataset.json")
+    orchestrator = Orchestrator(tmp_path / "identity.db", ROOT / "examples" / "demo_dataset.json")
     chatgpt = WebSourceDraft(
         source_id="s_chatgpt",
         source_type="volc_search_result",
@@ -1036,7 +1036,7 @@ def test_product_search_requires_competitor_identity(tmp_path, monkeypatch):
 
 def test_official_pricing_page_extracts_pricing_facts(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
-    orchestrator = Orchestrator(tmp_path / "pricing-facts.db", ROOT / "data" / "demo_dataset.json")
+    orchestrator = Orchestrator(tmp_path / "pricing-facts.db", ROOT / "examples" / "demo_dataset.json")
     source = {
         "id": "s_deepseek_pricing",
         "title": "模型 & 价格 | DeepSeek API Docs",
@@ -1220,17 +1220,8 @@ def test_archive_and_delete_history_tasks(client):
     assert client.get(f"/api/tasks/{task_to_delete['id']}").status_code == 404
 
 
-def test_5019_startup_uses_separate_clean_database(tmp_path):
-    ps1 = (ROOT / "启动_5019.ps1").read_text(encoding="utf-8")
-    bat = (ROOT / "启动_5019.bat").read_text(encoding="utf-8")
-    assert "5019" in ps1
-    assert "app_5019_clean.db" in ps1
-    assert "MOSS_DATABASE" in ps1
-    assert "5019" in bat
-    assert "app_5019_clean.db" in bat
-    assert "MOSS_DATABASE" in bat
-
-    clean_db = tmp_path / "app_5019_clean.db"
+def test_database_override_starts_with_an_empty_task_list(tmp_path):
+    clean_db = tmp_path / "isolated.db"
     app = create_app({"TESTING": True, "DATABASE": str(clean_db), "WORKFLOW_ASYNC": False})
     assert app.test_client().get("/api/tasks").get_json() == []
 
@@ -2040,7 +2031,7 @@ def test_score_dimensions_are_fixed_eight_formula_rows(client):
 
 def test_score_formula_uses_weighted_sources_and_claims(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
-    orchestrator = Orchestrator(tmp_path / "score-formula.db", ROOT / "data" / "demo_dataset.json")
+    orchestrator = Orchestrator(tmp_path / "score-formula.db", ROOT / "examples" / "demo_dataset.json")
     sources = [
         {
             "id": "s1",
@@ -2085,7 +2076,7 @@ def test_score_formula_uses_weighted_sources_and_claims(tmp_path, monkeypatch):
 
 def test_api_cost_formula_uses_log_price_normalization(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
-    orchestrator = Orchestrator(tmp_path / "api-cost-formula.db", ROOT / "data" / "demo_dataset.json")
+    orchestrator = Orchestrator(tmp_path / "api-cost-formula.db", ROOT / "examples" / "demo_dataset.json")
     sources = [
         {
             "id": "s1",
@@ -2139,7 +2130,7 @@ def test_api_cost_formula_uses_log_price_normalization(tmp_path, monkeypatch):
 
 def test_long_context_formula_uses_token_window_signal(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
-    orchestrator = Orchestrator(tmp_path / "context-formula.db", ROOT / "data" / "demo_dataset.json")
+    orchestrator = Orchestrator(tmp_path / "context-formula.db", ROOT / "examples" / "demo_dataset.json")
     base = {
         "source_type": "official_doc",
         "url_or_path": "https://example.com/context",
@@ -2202,7 +2193,7 @@ def test_report_dimensions_follow_industry_not_chat_ai_template(client):
 
 def test_ai_dimension_profile_keeps_api_cost_for_chatgpt_deepseek(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
-    orchestrator = Orchestrator(tmp_path / "dimension-profile.db", ROOT / "data" / "demo_dataset.json")
+    orchestrator = Orchestrator(tmp_path / "dimension-profile.db", ROOT / "examples" / "demo_dataset.json")
     profile = orchestrator._build_dimension_profile(
         {"id": "task", "industry": "AI 大模型与智能助手", "focus_areas_json": "[]"},
         ["ChatGPT", "DeepSeek"],
@@ -3075,7 +3066,7 @@ def test_failover_diagnostics_keeps_zhipu_filter_context():
 def test_manual_report_patch_updates_only_selected_table_row(tmp_path):
     db_path = tmp_path / "manual-table-patch.db"
     create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
-    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    orch = Orchestrator(db_path, ROOT / "examples" / "demo_dataset.json")
     task_id = "manual-table-task"
     sections = [
         {"key": "react_1", "title": "第一章 概览", "body": "第一章稳定内容。", "markdown": "第一章稳定内容。"},
@@ -3162,7 +3153,7 @@ def test_short_react_refresh_does_not_replace_richer_artifact(tmp_path, monkeypa
     monkeypatch.setenv("REACT_ARTIFACT_REPLACE_MIN_RATIO", "0.85")
     db_path = tmp_path / "artifact-protect.db"
     create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
-    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    orch = Orchestrator(db_path, ROOT / "examples" / "demo_dataset.json")
     task_id = "artifact-task"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -3189,7 +3180,7 @@ def test_short_react_refresh_does_not_replace_richer_artifact(tmp_path, monkeypa
 def test_repeated_qa_failure_handoff_is_manual_pending(tmp_path):
     db_path = tmp_path / "manual-pending.db"
     create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
-    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    orch = Orchestrator(db_path, ROOT / "examples" / "demo_dataset.json")
     task_id = "qa-task"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -3212,7 +3203,7 @@ def test_repeated_qa_failure_handoff_is_manual_pending(tmp_path):
 def test_qa_max_round_handoff_even_when_failure_signature_changes(tmp_path, monkeypatch):
     db_path = tmp_path / "manual-pending-max-rounds.db"
     create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
-    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    orch = Orchestrator(db_path, ROOT / "examples" / "demo_dataset.json")
     task_id = "qa-max-round-task"
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -3246,7 +3237,7 @@ def test_qa_max_round_handoff_even_when_failure_signature_changes(tmp_path, monk
 def test_qa_rework_analysis_logs_deepseek_repair_provider(tmp_path, monkeypatch):
     db_path = tmp_path / "deepseek-repair.db"
     create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
-    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    orch = Orchestrator(db_path, ROOT / "examples" / "demo_dataset.json")
     task_id = "deepseek-repair-task"
     now = utc_now_iso()
     with sqlite3.connect(db_path) as conn:
@@ -3331,7 +3322,7 @@ def test_qa_rework_analysis_logs_deepseek_repair_provider(tmp_path, monkeypatch)
 def test_manual_recheck_is_guarded_while_workflow_active(tmp_path):
     db_path = tmp_path / "busy.db"
     create_app({"TESTING": True, "DATABASE": str(db_path), "WORKFLOW_ASYNC": False})
-    orch = Orchestrator(db_path, ROOT / "data" / "demo_dataset.json")
+    orch = Orchestrator(db_path, ROOT / "examples" / "demo_dataset.json")
     task_id = "busy-task"
     with sqlite3.connect(db_path) as conn:
         conn.execute(

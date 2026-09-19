@@ -38,7 +38,9 @@ env/
 
 # Local-only reference material and copied helper packs
 测试资料/
-skills/
+/skills/*
+!/skills/moss-caper/
+!/skills/moss-firm-react/
 /启动_*.bat
 /启动_*.ps1
 /*说明.md

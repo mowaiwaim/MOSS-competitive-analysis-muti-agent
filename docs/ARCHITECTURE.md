@@ -15,7 +15,7 @@ flowchart LR
   ORCH --> Q["质检 Agent"]
   ORCH --> R["报告 Agent"]
   C --> SEARCH["主采集: 火山联网搜索 / Google Alerts RSS / AppArk"]
-  C --> AUX["ReAct 辅助: DuckDuckGo / 旧 Bing / 抓页 / 截图"]
+  C --> AUX["ReAct 辅助: DuckDuckGo / 抓页 / 截图"]
   A --> LLM["分析 API: DeepSeek -> 智谱 -> 豆包 / mock"]
   A --> DEEP["深度报告: DeepSeek direct thinking / 内层 StateGraph ReAct"]
   C --> DB

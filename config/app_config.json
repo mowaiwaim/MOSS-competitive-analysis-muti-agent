@@ -1,0 +1,205 @@
+{
+  "product_url_hints": {
+    "比亚迪": ["https://www.bydauto.com.cn/", "https://www.byd.com/cn"],
+    "byd": ["https://www.bydauto.com.cn/", "https://www.byd.com/cn"],
+    "小鹏": ["https://www.xiaopeng.com/", "https://www.xpeng.com/"],
+    "小鹏汽车": ["https://www.xiaopeng.com/"],
+    "xpeng": ["https://www.xiaopeng.com/", "https://www.xpeng.com/"],
+    "理想": ["https://www.lixiang.com/"],
+    "理想汽车": ["https://www.lixiang.com/"],
+    "li auto": ["https://www.lixiang.com/"],
+    "蔚来": ["https://www.nio.cn/"],
+    "nio": ["https://www.nio.cn/", "https://www.nio.com/"],
+    "特斯拉": ["https://www.tesla.cn/"],
+    "tesla": ["https://www.tesla.cn/", "https://www.tesla.com/"],
+    "chatgpt": ["https://chatgpt.com/", "https://openai.com/chatgpt/", "https://openai.com/api/pricing/", "https://platform.openai.com/docs"],
+    "openai": ["https://openai.com/", "https://openai.com/api/pricing/", "https://platform.openai.com/docs"],
+    "豆包": ["https://www.doubao.com/", "https://www.volcengine.com/docs/82379"],
+    "doubao": ["https://www.doubao.com/", "https://www.volcengine.com/docs/82379"],
+    "claude": ["https://claude.ai/", "https://www.anthropic.com/claude"],
+    "deepseek": ["https://www.deepseek.com/", "https://api-docs.deepseek.com/", "https://api-docs.deepseek.com/quick_start/pricing"],
+    "隆基绿能": ["https://www.longi.com/cn/", "https://www.longi.com/"],
+    "隆基": ["https://www.longi.com/cn/", "https://www.longi.com/"],
+    "longi": ["https://www.longi.com/cn/", "https://www.longi.com/"],
+    "爱旭股份": ["https://aikosolar.com/"],
+    "爱旭": ["https://aikosolar.com/"],
+    "aiko": ["https://aikosolar.com/"],
+    "通威股份": ["https://www.tongwei.cn/", "https://www.tongwei.com/"],
+    "通威": ["https://www.tongwei.cn/", "https://www.tongwei.com/"],
+    "tongwei": ["https://www.tongwei.cn/", "https://www.tongwei.com/"],
+    "中际旭创": ["https://www.zj-innolight.com/", "https://www.innolight.com/"],
+    "innolight": ["https://www.zj-innolight.com/", "https://www.innolight.com/"],
+    "抖音": ["https://www.douyin.com/", "https://creator.douyin.com/", "https://www.douyin.com/business/"],
+    "douyin": ["https://www.douyin.com/", "https://creator.douyin.com/"],
+    "小红书": ["https://www.xiaohongshu.com/", "https://creator.xiaohongshu.com/"],
+    "xiaohongshu": ["https://www.xiaohongshu.com/", "https://creator.xiaohongshu.com/"],
+    "快手": ["https://www.kuaishou.com/"],
+    "kuaishou": ["https://www.kuaishou.com/"],
+    "bilibili": ["https://www.bilibili.com/"],
+    "B站": ["https://www.bilibili.com/"]
+  },
+  "product_aliases": {
+    "比亚迪": ["比亚迪", "byd", "bydauto"],
+    "byd": ["比亚迪", "byd", "bydauto"],
+    "小鹏": ["小鹏", "小鹏汽车", "xpeng", "xiaopeng"],
+    "小鹏汽车": ["小鹏", "小鹏汽车", "xpeng", "xiaopeng"],
+    "xpeng": ["小鹏", "小鹏汽车", "xpeng", "xiaopeng"],
+    "理想": ["理想", "理想汽车", "li auto", "lixiang"],
+    "理想汽车": ["理想", "理想汽车", "li auto", "lixiang"],
+    "li auto": ["理想", "理想汽车", "li auto", "lixiang"],
+    "蔚来": ["蔚来", "nio"],
+    "nio": ["蔚来", "nio"],
+    "特斯拉": ["特斯拉", "tesla"],
+    "tesla": ["特斯拉", "tesla"],
+    "chatgpt": ["chatgpt", "openai"],
+    "openai": ["openai", "chatgpt"],
+    "豆包": ["豆包", "doubao", "字节跳动"],
+    "doubao": ["doubao", "豆包", "bytedance"],
+    "claude": ["claude", "anthropic"],
+    "deepseek": ["deepseek"],
+    "隆基绿能": ["隆基绿能", "隆基", "隆基股份", "longi"],
+    "隆基": ["隆基绿能", "隆基", "隆基股份", "longi"],
+    "longi": ["longi", "隆基", "隆基绿能"],
+    "爱旭股份": ["爱旭股份", "爱旭", "爱旭科技", "aiko", "aikosolar"],
+    "爱旭": ["爱旭股份", "爱旭", "爱旭科技", "aiko", "aikosolar"],
+    "aiko": ["aiko", "aikosolar", "爱旭", "爱旭股份"],
+    "通威股份": ["通威股份", "通威", "通威集团", "通威太阳能", "tongwei"],
+    "通威": ["通威股份", "通威", "通威集团", "通威太阳能", "tongwei"],
+    "tongwei": ["tongwei", "通威", "通威股份", "通威集团"],
+    "中际旭创": ["中际旭创", "中际旭创股份有限公司", "旭创科技", "innolight", "zj-innolight"],
+    "innolight": ["innolight", "中际旭创", "旭创科技"],
+    "酱香型白酒": ["酱香型白酒", "酱香酒", "酱香", "白酒香型"],
+    "二锅头": ["二锅头", "北京二锅头", "红星二锅头", "牛栏山二锅头"],
+    "抖音": ["抖音", "douyin", "tiktok中国版", "抖音短视频", "抖音app"],
+    "douyin": ["douyin", "抖音", "tiktok china"],
+    "小红书": ["小红书", "xiaohongshu", "RED", "小红书app", "rednote"],
+    "xiaohongshu": ["xiaohongshu", "小红书", "RED", "rednote"],
+    "快手": ["快手", "kuaishou", "快手短视频", "快手app"],
+    "kuaishou": ["kuaishou", "快手"],
+    "bilibili": ["bilibili", "B站", "哔哩哔哩", "b站"],
+    "B站": ["B站", "bilibili", "哔哩哔哩"]
+  },
+  "product_related_terms": {
+    "隆基绿能": ["光伏", "组件", "硅片", "单晶", "太阳能", "BIPV", "电池"],
+    "隆基": ["光伏", "组件", "硅片", "单晶", "太阳能", "BIPV", "电池"],
+    "爱旭股份": ["光伏", "电池", "组件", "ABC电池", "N型", "太阳能", "aikosolar"],
+    "爱旭": ["光伏", "电池", "组件", "ABC电池", "N型", "太阳能", "aikosolar"],
+    "通威股份": ["光伏", "硅料", "电池片", "组件", "渔光互补", "太阳能", "绿色能源"],
+    "通威": ["光伏", "硅料", "电池片", "组件", "渔光互补", "太阳能", "绿色能源"],
+    "中际旭创": ["光模块", "光通信", "数据中心", "800G", "1.6T", "CPO", "高速光互联"],
+    "innolight": ["光模块", "光通信", "数据中心", "800G", "1.6T", "CPO", "高速光互联"],
+    "天孚通信": ["光器件", "光通信", "数据中心", "光模块", "高速光引擎"],
+    "新易盛": ["光模块", "光通信", "数据中心", "高速率", "800G"],
+    "酱香型白酒": ["白酒", "酱香", "茅台镇", "坤沙", "香型", "价格带", "代表品牌", "消费场景"],
+    "二锅头": ["白酒", "清香型", "北京", "红星", "牛栏山", "低价白酒", "消费场景", "价格带"],
+    "抖音": ["短视频", "直播", "电商", "创作者", "广告", "算法推荐", "社交", "字节跳动", "douyin", "直播带货", "信息流", "内容分发", "用户增长"],
+    "douyin": ["短视频", "直播", "电商", "创作者", "广告", "算法推荐", "社交", "字节跳动", "douyin", "直播带货"],
+    "小红书": ["种草", "社区", "电商", "笔记", "UGC", "生活方式", "社交电商", "内容社区", "kol", "品牌营销", "用户口碑"],
+    "xiaohongshu": ["种草", "社区", "电商", "笔记", "UGC", "生活方式", "社交电商", "内容社区", "kol"],
+    "快手": ["短视频", "直播", "老铁", "电商", "下沉市场", "社区", "创作者", "广告", "直播带货"],
+    "kuaishou": ["短视频", "直播", "电商", "下沉市场", "社区", "创作者"],
+    "bilibili": ["中视频", "弹幕", "二次元", "社区", "创作者", "大会员", "ugc", "游戏", "直播", "番剧"],
+    "B站": ["中视频", "弹幕", "二次元", "社区", "创作者", "大会员", "ugc", "游戏"]
+  },
+  "industry_related_terms": [
+    {"pattern": "煤炭|煤矿|矿山|能源矿产", "terms": ["煤炭", "煤矿", "矿山", "产量", "储量", "安全生产", "煤化工"]},
+    {"pattern": "小金属|有色金属|稀土|钨|钼|锑|锂|钴|镍|锡|钛|铟|锗", "terms": ["小金属", "有色金属", "稀土", "矿产", "价格", "产能", "下游应用"]},
+    {"pattern": "光伏|新能源|太阳能", "terms": ["光伏", "太阳能", "组件", "电池", "硅片", "产能", "出货量"]},
+    {"pattern": "白酒|酒类|消费品", "terms": ["白酒", "价格带", "代表品牌", "渠道", "消费场景", "用户口碑"]},
+    {"pattern": "抖音|快手|小红书|bilibili|B站|tiktok|微博|知乎|豆瓣|内容社区|短视频|直播平台|社交平台|社交媒体", "terms": ["DAU", "MAU", "用户规模", "内容生态", "创作者", "直播", "电商", "广告", "商业化", "算法推荐", "社交", "用户增长", "留存", "变现", "评价", "口碑"]}
+  ],
+  "search_high_authority_domains": [
+    "sse.com.cn", "szse.cn", "cninfo.com.cn", "static.cninfo.com.cn", "gov.cn"
+  ],
+  "search_medium_authority_domains": [
+    "baike.baidu.com", "wikipedia.org", "eastmoney.com", "sina.com.cn",
+    "stcn.com", "cls.cn", "36kr.com", "jiemian.com", "yicai.com"
+  ],
+  "search_low_value_domains": [
+    "youtube.com", "bilibili.com", "douyin.com", "kuaishou.com", "weibo.com"
+  ],
+  "product_search_queries": {
+    "豆包": "豆包 官方 产品 功能 定价 字节跳动",
+    "doubao": "Doubao 豆包 官方 产品 功能 定价 ByteDance",
+    "抖音": "抖音 官方 产品 功能 创作者 商业化 广告",
+    "小红书": "小红书 官方 产品 社区 电商 种草 品牌"
+  },
+  "official_source_seeds": {
+    "chatgpt": [
+      {"module": "官方价格/API", "url": "https://openai.com/api/pricing/", "title": "OpenAI API Pricing", "source_role": "official_pricing"},
+      {"module": "官网/功能", "url": "https://openai.com/chatgpt/", "title": "ChatGPT Product", "source_role": "official"},
+      {"module": "官方文档", "url": "https://platform.openai.com/docs", "title": "OpenAI Platform Docs", "source_role": "official_doc"},
+      {"module": "安全/企业", "url": "https://openai.com/business-data/", "title": "OpenAI Business Data", "source_role": "official"},
+      {"module": "安全/企业", "url": "https://openai.com/chatgpt/enterprise/", "title": "ChatGPT Enterprise", "source_role": "official"},
+      {"module": "用户评价", "url": "https://www.g2.com/products/chatgpt/reviews", "title": "G2 ChatGPT Reviews", "source_role": "review"},
+      {"module": "用户评价", "url": "https://apps.apple.com/us/app/chatgpt/id6448311069", "title": "Apple App Store ChatGPT", "source_role": "review"},
+      {"module": "用户评价", "url": "https://www.trustpilot.com/review/chatgpt.com", "title": "Trustpilot ChatGPT", "source_role": "review"}
+    ],
+    "openai": [
+      {"module": "官方价格/API", "url": "https://openai.com/api/pricing/", "title": "OpenAI API Pricing", "source_role": "official_pricing"},
+      {"module": "官方文档", "url": "https://platform.openai.com/docs", "title": "OpenAI Platform Docs", "source_role": "official_doc"}
+    ],
+    "deepseek": [
+      {"module": "官方价格/API", "url": "https://api-docs.deepseek.com/quick_start/pricing", "title": "DeepSeek API Pricing", "source_role": "official_pricing"},
+      {"module": "官方价格/API", "url": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing-details-usd", "title": "DeepSeek API Pricing Details USD", "source_role": "official_pricing"},
+      {"module": "官网/功能", "url": "https://www.deepseek.com/", "title": "DeepSeek Product", "source_role": "official"},
+      {"module": "官方文档", "url": "https://api-docs.deepseek.com/", "title": "DeepSeek API Docs", "source_role": "official_doc"},
+      {"module": "安全/企业", "url": "https://cdn.deepseek.com/policies/zh-CN/deepseek-open-platform-terms-of-service.html", "title": "DeepSeek Open Platform Terms", "source_role": "official_doc"},
+      {"module": "安全/企业", "url": "https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html", "title": "DeepSeek Privacy Policy", "source_role": "official_doc"},
+      {"module": "官方文档", "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro", "title": "Hugging Face DeepSeek-V4-Pro", "source_role": "official_doc"},
+      {"module": "用户评价", "url": "https://www.g2.com/products/deepseek/reviews", "title": "G2 DeepSeek Reviews", "source_role": "review"},
+      {"module": "用户评价", "url": "https://apps.apple.com/us/app/deepseek-ai-assistant/id6737597349", "title": "Apple App Store DeepSeek AI Assistant", "source_role": "review"}
+    ],
+    "抖音": [
+      {"module": "官网/功能", "url": "https://www.douyin.com/", "title": "抖音官网", "source_role": "official"},
+      {"module": "官网/功能", "url": "https://creator.douyin.com/", "title": "抖音创作者平台", "source_role": "official_doc"},
+      {"module": "商业化", "url": "https://www.douyin.com/business/", "title": "抖音广告投放平台", "source_role": "official"},
+      {"module": "用户评价", "url": "https://apps.apple.com/cn/app/抖音/id1142110895", "title": "Apple App Store 抖音", "source_role": "review"}
+    ],
+    "小红书": [
+      {"module": "官网/功能", "url": "https://www.xiaohongshu.com/", "title": "小红书官网", "source_role": "official"},
+      {"module": "官网/功能", "url": "https://creator.xiaohongshu.com/", "title": "小红书创作者平台", "source_role": "official_doc"},
+      {"module": "用户评价", "url": "https://apps.apple.com/cn/app/小红书/id741292507", "title": "Apple App Store 小红书", "source_role": "review"}
+    ]
+  },
+  "reference_ai_api_prices": {
+    "chatgpt": [
+      {"plan_name": "OpenAI GPT-5.5", "price_type": "input_cached", "amount": 0.40, "currency": "USD"},
+      {"plan_name": "OpenAI GPT-5.5", "price_type": "input", "amount": 4.00, "currency": "USD"},
+      {"plan_name": "OpenAI GPT-5.5", "price_type": "output", "amount": 30.00, "currency": "USD"},
+      {"plan_name": "OpenAI GPT-5.5 mini", "price_type": "input_cached", "amount": 0.175, "currency": "USD"},
+      {"plan_name": "OpenAI GPT-5.5 mini", "price_type": "input", "amount": 1.75, "currency": "USD"},
+      {"plan_name": "OpenAI GPT-5.5 mini", "price_type": "output", "amount": 14.00, "currency": "USD"}
+    ],
+    "deepseek": [
+      {"plan_name": "DeepSeek V4-Pro", "price_type": "input_cached", "amount": 0.003625, "currency": "USD"},
+      {"plan_name": "DeepSeek V4-Pro", "price_type": "input", "amount": 0.435, "currency": "USD"},
+      {"plan_name": "DeepSeek V4-Pro", "price_type": "output", "amount": 0.87, "currency": "USD"},
+      {"plan_name": "DeepSeek V4-Flash", "price_type": "input_cached", "amount": 0.0028, "currency": "USD"},
+      {"plan_name": "DeepSeek V4-Flash", "price_type": "input", "amount": 0.14, "currency": "USD"},
+      {"plan_name": "DeepSeek V4-Flash", "price_type": "output", "amount": 0.28, "currency": "USD"}
+    ]
+  },
+  "search_block_hosts": {
+    "default": "bilibili.com|kuaishou.com|weibo.com",
+    "content_social": "",
+    "ai": "bilibili.com|douyin.com|kuaishou.com|weibo.com",
+    "software": "douyin.com|kuaishou.com|weibo.com",
+    "automotive": "douyin.com|kuaishou.com|weibo.com",
+    "generic": "bilibili.com|douyin.com|kuaishou.com|weibo.com"
+  },
+  "search_block_hosts_self_exempt": true,
+  "search_low_value_domains_by_industry": {
+    "content_social": [],
+    "ai": ["youtube.com", "bilibili.com", "douyin.com", "kuaishou.com", "weibo.com"],
+    "software": ["douyin.com", "kuaishou.com", "weibo.com"],
+    "automotive": ["douyin.com", "kuaishou.com"],
+    "generic": ["youtube.com", "bilibili.com", "douyin.com", "kuaishou.com", "weibo.com"]
+  },
+  "search_high_value_domains_by_industry": {
+    "content_social": ["app store", "google play", "zhihu.com", "36kr.com", "jiemian.com", "g2.com", "trustpilot.com"],
+    "ai": ["github.com", "huggingface.co", "openai.com", "anthropic.com"],
+    "software": ["g2.com", "capterra.com", "trustpilot.com", "producthunt.com"],
+    "generic": ["app store", "google play", "zhihu.com", "36kr.com"]
+  }
+}

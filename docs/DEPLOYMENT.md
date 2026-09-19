@@ -2,6 +2,8 @@
 
 ## 本地运行
 
+要求 Python 3.12+。推荐 Windows 用户从仓库根目录运行 `start.bat` 或 `powershell -File scripts/start.ps1`。首次启动自动创建虚拟环境并安装 `requirements.lock.txt` 中已验证的依赖；已有环境需要更新时加 `-Install`，自定义端口时加 `-Port 5020`。
+
 ```powershell
 cd "path\to\MOSS-competitive-analysis"
 python app.py
@@ -36,6 +38,8 @@ $env:DOUBAO_MODEL_NAME="Doubao-Seed-2.0-lite"
 
 也可以在项目根目录的 `.env.local` 写入同名变量。本地文件已被 `.gitignore` 忽略，系统环境变量会覆盖 `.env.local`。
 
+程序只自动读取本项目的 `.env`、`.env.local`。需要额外配置文件时，显式设置 `MOSS_ENV_PATH`。数据库位置可通过 `MOSS_DATABASE` 指定，默认是项目内的 `data/app.db`。依赖统一从当前 Python 环境加载。
+
 常规结构化分析、搜索规划、问卷和访谈辅助仍可使用 `LLM_PROVIDER=doubao`；未配置时使用 `mock` Provider。顶层多 Agent 流程由 LangGraph StateGraph 编排，Orchestrator 承载节点业务逻辑。深度报告缺少模型 Key、网络失败或返回不符合 Schema 时会自动降级规则/模板流程。验证真实调用时，新建任务后查看日志中的 `workflow_engine=langgraph_stategraph`、`model_provider`、`preferred_order`、`deep_report_execution_mode` 和工具调用记录。
 
 主采集来源：
@@ -45,29 +49,32 @@ $env:VOLC_SEARCH_API_KEY="your-volc-search-api-key"
 $env:GOOGLE_ALERTS_RSS_URL="your-google-alerts-rss-url"
 ```
 
-火山联网搜索、Google Alerts RSS 和 AppArk 是报告主采集口径。ReAct 辅助工具中的 DuckDuckGo 搜索、旧 Bing 搜索类、requests 抓页和 Playwright 截图能力保留，用于深度报告补充和调试，不在本轮删除。
+火山联网搜索、Google Alerts RSS 和 AppArk 是报告主采集口径。ReAct 辅助工具支持 DuckDuckGo 搜索、requests 抓页和 Playwright 截图。截图需执行 `python -m playwright install chromium` 安装浏览器；AppArk 浏览器连接还需本机 Chrome 开启对应的 CDP 地址。
 
 飞书问卷发布：
 
 ```powershell
-$env:FEISHU_CLI_PATH="$env:LOCALAPPDATA\Microsoft\WinGet\Packages\OpenJS.NodeJS.LTS_Microsoft.Winget.Source_8wekyb3d8bbwe\node-v24.16.0-win-x64\lark-cli.cmd"
+$env:FEISHU_CLI_PATH="C:\path\to\lark-cli.cmd"
 $env:FEISHU_IDENTITY="user"
 $env:FEISHU_DEFAULT_FOLDER_TOKEN=""
 & $env:FEISHU_CLI_PATH auth status
 ```
 
-`FEISHU_CLI_PATH` 不设置时会优先寻找本机 WinGet Node.js LTS 目录下的 `lark-cli.cmd`，再退回 PATH 中的 `lark-cli`。`FEISHU_DEFAULT_FOLDER_TOKEN` 可选；为空时使用当前授权用户的默认创建位置。飞书授权信息不得写入前端或日志。
+`FEISHU_CLI_PATH` 不设置时使用 PATH 中的 `lark-cli` 或 `feishu`。自定义安装位置可通过该变量指定。`FEISHU_DEFAULT_FOLDER_TOKEN` 可选；为空时使用当前授权用户的默认创建位置。飞书授权信息不得写入前端或日志。
 
 ## 数据库与文件
 
 - 数据库：`data/app.db`
 - 上传目录：`data/uploads/`
-- 样例数据：`data/demo_dataset.json`
+- 样例数据：`examples/demo_dataset.json`
+- 公共配置：`config/app_config.json`
 - 问卷设计：`questionnaire_designs`
 - 问卷回答：`questionnaire_responses`
 - 问卷发布记录：`questionnaire_publish_targets`
 
 `.gitignore` 已排除数据库、上传目录、`.env*`、缓存和下载 zip。
+
+公共配置与演示数据纳入版本控制。演示摘要和参考价格仅用于缓存示例，真实竞品报告仍需核验来源、适用条件与时效。CAPER 与 FIRM-ReAct 的独立调用方式见根目录 README，它们没有自动替换现有在线流程。
 
 ## 演示建议
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-CONFIG_DIR = Path(__file__).resolve().parent / "data"
+CONFIG_DIR = Path(__file__).resolve().parent / "config"
 CONFIG_PATH = CONFIG_DIR / "app_config.json"
 
 

@@ -2035,7 +2035,7 @@ class Orchestrator:
                     "采集 Agent",
                     "auto_config_notice",
                     f"{name} 未在 app_config.json 中找到预设配置，将使用自动生成的搜索词和别名。"
-                    f"如需更精准结果，可在 data/app_config.json 中为该产品添加 url_hints、aliases 和 related_terms。",
+                    f"如需更精准结果，可在 config/app_config.json 中为该产品添加 url_hints、aliases 和 related_terms。",
                     severity="info",
                     meta={"competitor": name},
                 )

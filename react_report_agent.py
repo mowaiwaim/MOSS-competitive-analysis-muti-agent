@@ -3,8 +3,6 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import site
-import sys
 import textwrap
 import time
 from dataclasses import dataclass, field
@@ -12,17 +10,6 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
-
-def _enable_user_site_packages() -> None:
-    try:
-        user_site = site.getusersitepackages()
-    except Exception:
-        return
-    if user_site and os.path.isdir(user_site) and user_site not in sys.path:
-        sys.path.insert(0, user_site)
-
-
-_enable_user_site_packages()
 
 import requests
 
@@ -445,7 +432,7 @@ def build_user_task(task: dict[str, Any], sources: list[dict[str, Any]], claims:
         f"关注维度：{'、'.join(focus) or '功能、价格、用户、增长、SWOT'}\n\n"
         "已入库来源（可优先使用，报告中的来源 URL 应尽量来自这里或工具搜索结果）：\n"
         f"{source_block}\n\n"
-        "已通过系统 1 多 Agent 链路形成的结构化结论：\n"
+        "已通过多 Agent 结构化分析流程形成的结构化结论：\n"
         f"{claim_block}\n\n"
         "请按系统提示先补足公开信息，再输出完整 11 章 Markdown 报告。"
         "最终正文应以长文形式直接呈现，不要输出 JSON，不要输出执行过程。"
@@ -718,13 +705,13 @@ def _fallback_report(task: dict[str, Any], sources: list[dict[str, Any]], claims
     markdown = f"""# 竞品调研报告：{industry}
 
 ## 一、报告概述（Executive Summary）
-本报告围绕 {competitor_names} 在 {industry} 赛道中的产品定位、核心能力、商业化路径、用户场景、增长方式和潜在壁垒展开。当前报告优先使用系统 1 已入库的来源、证据分片和通过质检的结构化结论，并以系统 2 的 11 章深度报告结构组织正文。由于本轮未实际调用 ReAct 模型或工具，降级原因是：{reason}。
+本报告围绕 {competitor_names} 在 {industry} 赛道中的产品定位、核心能力、商业化路径、用户场景、增长方式和潜在壁垒展开。当前报告优先使用结构化分析流程中已入库的来源、证据分片和通过质检的结构化结论，并以深度分析的 11 章深度报告结构组织正文。由于本轮未实际调用 ReAct 模型或工具，降级原因是：{reason}。
 
 核心发现：
 - **竞争判断要从“功能列表”推进到“工作流位置”**：仅比较功能是否存在不足以支撑产品决策，更重要的是各竞品在用户真实任务中的入口、连续使用频率、协作方式和替代成本。
 - **价格与商业化是高风险信息**：套餐、API 单价、折扣和权益经常变化，必须以官方价格页、销售材料或可信第三方页面为依据；未抓到明确来源时只能标注“待核实”。
 - **用户口碑需要交叉验证**：单一官网或营销页面只能说明厂商叙事，用户评价、社区反馈、应用商店评论和案例库才能支撑体验判断。
-- **系统 1 的可视化仍然有价值**：热力图、定位图、SWOT、决策矩阵和来源目录适合做管理层快速浏览；本章正文则承担系统 2 风格的深度解释。
+- **结构化分析流程的可视化仍然有价值**：热力图、定位图、SWOT、决策矩阵和来源目录适合做管理层快速浏览；本章正文则承担深度分析风格的深度解释。
 - **下一步应补强动态证据**：建议配置 DeepSeek Key，让 DeepSeek direct thinking 优先生成高质量长报告；需要搜索、抓页或截图补证时，再由内层 StateGraph ReAct 工具循环执行。
 
 ## 二、市场与赛道分析（Market Context）
@@ -753,7 +740,7 @@ def _fallback_report(task: dict[str, Any], sources: list[dict[str, Any]], claims
 - **第三层：信息不足/新兴竞品**：需要继续补采官网、产品入口、价格、评价和案例，先作为监控对象。
 
 ### 3.3 对比口径
-本报告不把“曝光度高”等同于“竞争力强”，而是从能力覆盖、商业化成熟度、渠道效率、用户信任和迁移壁垒五个角度判断。系统 1 的可视化模块会在正文后继续呈现这些维度的结构化结果。
+本报告不把“曝光度高”等同于“竞争力强”，而是从能力覆盖、商业化成熟度、渠道效率、用户信任和迁移壁垒五个角度判断。结构化分析流程的可视化模块会在正文后继续呈现这些维度的结构化结果。
 
 ## 四、核心能力拆解（Product Capability Analysis）
 {competitor_sections}
@@ -769,7 +756,7 @@ def _fallback_report(task: dict[str, Any], sources: list[dict[str, Any]], claims
 企业版通常围绕权限、审计、数据隔离、SSO、私有化/专属实例、法务条款和客户成功服务展开。对 {competitor_names} 的企业化成熟度，建议后续继续抓取安全页、企业页、案例库和帮助中心。
 
 ### 5.4 当前证据边界
-本轮降级报告不会编造具体价格。若系统 1 已解析出 pricing facts，页面后续的可视化和价格模块可以继续保留；深度正文只陈述已被来源支持的商业化判断。
+本轮降级报告不会编造具体价格。若结构化分析流程 已解析出 pricing facts，页面后续的可视化和价格模块可以继续保留；深度正文只陈述已被来源支持的商业化判断。
 
 ## 六、增长与分发策略（Growth Strategy）
 ### 6.1 官网与搜索入口
@@ -799,7 +786,7 @@ def _fallback_report(task: dict[str, Any], sources: list[dict[str, Any]], claims
 
 ## 八、优劣势对比（SWOT / 对比矩阵）
 ### 8.1 优势
-优势必须来自可验证事实，例如明确功能、用户案例、生态集成、价格优势、行业客户或高频评价。对 {competitor_names}，已有证据支持的优势会在系统 1 的 SWOT 和可视化模块继续展示。
+优势必须来自可验证事实，例如明确功能、用户案例、生态集成、价格优势、行业客户或高频评价。对 {competitor_names}，已有证据支持的优势会在结构化分析流程的 SWOT 和可视化模块继续展示。
 
 ### 8.2 劣势
 劣势不能只写“功能少”或“体验差”，应定位到具体环节：学习成本、输出质量不稳定、价格不透明、缺少企业治理、移动端/网页端割裂、帮助文档不足或用户支持弱。
@@ -844,13 +831,13 @@ def _fallback_report(task: dict[str, Any], sources: list[dict[str, Any]], claims
 {source_appendix}
 
 ### 11.2 测试方法
-- 系统 1：前端创建任务，Orchestrator 调度采集 Agent、分析 Agent、质检 Agent 和报告 Agent。
-- 系统 2 能力：配置模型 Key 后，分析 Agent 优先使用 DeepSeek direct thinking 输出 11 章深度报告；需要动态补证时使用内层 StateGraph ReAct 工具循环搜索、抓取网页和可选截图。
+- 工作流程：前端创建任务，Orchestrator 调度采集 Agent、分析 Agent、质检 Agent 和报告 Agent。
+- 深度报告：配置模型 Key 后，分析 Agent 优先使用 DeepSeek direct thinking 输出 11 章深度报告；需要动态补证时使用内层 StateGraph ReAct 工具循环搜索、抓取网页和可选截图。
 - 证据策略：官网、价格页、文档、案例、应用商店、社区评价和新闻稿优先；搜索摘要只能作为线索。
 - 合规边界：所有关键事实必须回链来源；敏感信息和 API Key 不进入日志或报告正文。
 
 ### 11.3 信息不足说明
-本报告当前处于本地降级模式，深度结构已经按系统 2 报告组织，但未执行实时模型生成或 ReAct 检索。填入 `.env` 中的 `DEEPSEEK_API_KEY` 后，系统会优先使用 DeepSeek direct thinking 生成更接近系统 2 输出密度的报告。
+本报告当前处于本地降级模式，已按深度报告结构组织，但未执行实时模型生成或 ReAct 检索。填入 `.env` 中的 `DEEPSEEK_API_KEY` 后，系统会优先使用 DeepSeek direct thinking 生成深度分析报告。
 """
     return ReactReportResult(
         enabled=False,

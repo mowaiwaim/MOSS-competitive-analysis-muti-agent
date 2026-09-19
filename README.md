@@ -21,15 +21,19 @@ MOSS团队小莫项目。系统面向竞品分析场景，支持从竞品输入�
 - 数据库：SQLite
 - 前端：HTML + CSS + JavaScript
 - PDF：ReportLab + pypdf
-- 数据采集：主采集使用火山联网搜索、Google Alerts RSS、AppArk；ReAct 辅助工具保留 DuckDuckGo 搜索、旧 Bing 搜索类、requests 抓页和 Playwright 截图能力
+- 数据采集：主采集使用火山联网搜索、Google Alerts RSS、AppArk；ReAct 辅助工具支持 DuckDuckGo 搜索、requests 抓页和 Playwright 截图
 
 ## 快速启动
+
+要求 Python 3.12 或更新版本。Windows 可直接运行 `start.bat`，或执行 `powershell -File scripts/start.ps1`。首次运行会创建 `.venv` 并安装依赖，后续启动复用该环境。使用 `-Install` 更新依赖，使用 `-Port 5020` 自定义端口。
+
+手动安装：
 
 ```powershell
 cd "path\to\MOSS-competitive-analysis"
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements.lock.txt
 copy .env.example .env
 ```
 
@@ -44,6 +48,24 @@ python -m flask --app app run --host 127.0.0.1 --port 5016
 ```text
 http://127.0.0.1:5016
 ```
+
+使用截图工具时，另行执行 `python -m playwright install chromium`。模型、联网采集和飞书发布需要各自的配置或授权。公共配置随代码提供，不需要其他本地项目目录。
+
+`requirements.lock.txt` 固定本次验证过的依赖版本。`requirements.txt` 保留直接依赖范围，升级后需重新验证并更新锁定文件。
+
+## CAPER 与 FIRM-ReAct Skills
+
+- [CAPER 同口径配对证据重排](skills/moss-caper/SKILL.md)：按比较收益与新增证据成本选择完整双边证据包，保留缺证和冲突。
+- [FIRM-ReAct 证伪引导的最小遗憾策略](skills/moss-firm-react/SKILL.md)：计算显式情形下的选型风险，以最多两步前瞻选择核验动作，并记录真实观察与费用。
+
+两个 Skill 复用 `competitive_evidence/` 的 Python 实现。当前为独立调用入口，尚未自动接入网页中的采集、分析或质检节点。完整机制、字段和核验要求见[算法说明](competitive_evidence/ALGORITHMS.md)。
+
+```powershell
+python skills/moss-caper/scripts/run.py --input competitive_evidence/examples/caper_input.json
+python skills/moss-firm-react/scripts/run.py plan --input competitive_evidence/examples/firm_pricing_input.json
+```
+
+示例均为合成输入，功能测试不代表实际模型效果提升。Skill 目录与仓库一起使用，不单独复制算法副本。
 
 ## 环境变量
 
@@ -72,15 +94,21 @@ http://127.0.0.1:5016
 ├── appark_collector.py       # AppArk 市场数据采集
 ├── static/                   # 前端脚本和样式
 ├── templates/                # Flask 页面模板
+├── config/app_config.json    # 公开产品别名、搜索规则与参考配置
+├── examples/demo_dataset.json # 离线演示数据
+├── competitive_evidence/     # CAPER、FIRM-ReAct 共享算法与调用协议
+├── skills/                   # 两个 Skill 的操作说明与薄启动入口
+├── scripts/start.ps1         # 通用 Windows 启动器
 ├── docs/                     # 架构、部署和协议说明
 ├── tests/                    # 自动化测试
-└── requirements.txt          # Python 依赖
+├── requirements.txt          # Python 直接依赖范围
+└── requirements.lock.txt     # 已验证的完整依赖版本
 ```
 
 ## 运行测试
 
 ```powershell
-python -m pytest tests\test_app.py -q
+python -m pytest tests -q
 ```
 
 ## 安全说明

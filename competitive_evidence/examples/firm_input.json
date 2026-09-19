@@ -1,0 +1,47 @@
+{
+  "metadata": {"synthetic": true, "purpose": "功能示例：互补查询，不是效果实验或真实竞品证据"},
+  "problem": {
+    "hard_constraints_prechecked": true,
+    "sources": [
+      {
+        "id": "fixture-spec",
+        "uri": "fixture://firm/complementary-bits",
+        "kind": "synthetic_fixture",
+        "content": "合成规格：候选 A 与 B 在全部四个情形下均通过硬门槛。两个二元事实 x、y 定义四种可行情形。用户示例效用：x=y 时 A=10、B=0，x!=y 时 A=0、B=10。查询 q-x 与 q-y 分别准确回答对应二元事实，每次预估费用 1。此数据仅用于验证两步互补查询的功能。"
+      }
+    ],
+    "decisions": [{"id": "A", "label": "合成候选 A"}, {"id": "B", "label": "合成候选 B"}],
+    "scenarios": [
+      {"id": "s00", "label": "x=0 且 y=0", "source_ids": ["fixture-spec"]},
+      {"id": "s01", "label": "x=0 且 y=1", "source_ids": ["fixture-spec"]},
+      {"id": "s10", "label": "x=1 且 y=0", "source_ids": ["fixture-spec"]},
+      {"id": "s11", "label": "x=1 且 y=1", "source_ids": ["fixture-spec"]}
+    ],
+    "utility": {
+      "description": "用户提供的合成偏好表，以两个事实是否相同决定候选效用。",
+      "source_ids": ["fixture-spec"],
+      "values": {"s00": {"A": 10, "B": 0}, "s01": {"A": 0, "B": 10}, "s10": {"A": 0, "B": 10}, "s11": {"A": 10, "B": 0}}
+    },
+    "queries": [
+      {
+        "id": "q-x", "tool": "evidence.verify", "args": {"fact": "x", "question": "核验合成事实 x 是 0 还是 1"},
+        "scope": {"fixture": "complementary-bits", "fact": "x"}, "cost": 1,
+        "source_ids": ["fixture-spec"],
+        "outcomes": [
+          {"id": "x0", "scenario_ids": ["s00", "s01"], "source_ids": ["fixture-spec"], "description": "x=0"},
+          {"id": "x1", "scenario_ids": ["s10", "s11"], "source_ids": ["fixture-spec"], "description": "x=1"}
+        ]
+      },
+      {
+        "id": "q-y", "tool": "evidence.verify", "args": {"fact": "y", "question": "核验合成事实 y 是 0 还是 1"},
+        "scope": {"fixture": "complementary-bits", "fact": "y"}, "cost": 1,
+        "source_ids": ["fixture-spec"],
+        "outcomes": [
+          {"id": "y0", "scenario_ids": ["s00", "s10"], "source_ids": ["fixture-spec"], "description": "y=0"},
+          {"id": "y1", "scenario_ids": ["s01", "s11"], "source_ids": ["fixture-spec"], "description": "y=1"}
+        ]
+      }
+    ]
+  },
+  "config": {"budget": 4, "max_calls": 4, "max_failures": 2, "regret_threshold": 0, "min_gain": 0, "lookahead": 2}
+}

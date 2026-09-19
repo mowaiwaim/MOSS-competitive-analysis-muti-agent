@@ -7,7 +7,6 @@ import uuid
 import csv
 import io
 import re
-import site
 import sys
 import time
 import zipfile
@@ -15,17 +14,6 @@ import threading
 from pathlib import Path
 from typing import Any
 
-
-def _enable_user_site_packages() -> None:
-    try:
-        user_site = site.getusersitepackages()
-    except Exception:
-        return
-    if user_site and os.path.isdir(user_site) and user_site not in sys.path:
-        sys.path.insert(0, user_site)
-
-
-_enable_user_site_packages()
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
 from pydantic import ValidationError
@@ -42,14 +30,13 @@ from schema import TaskCreate, utc_now_iso
 
 
 BASE_DIR = Path(__file__).resolve().parent
-APP_VERSION = "20260622-start-ui-2"
+APP_VERSION = "20260919"
 DEFAULT_DB = Path(os.environ.get("MOSS_DATABASE") or (BASE_DIR / "data" / "app.db"))
-DATASET_PATH = BASE_DIR / "data" / "demo_dataset.json"
+DATASET_PATH = BASE_DIR / "examples" / "demo_dataset.json"
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".pdf"}
 ENV_PATH = BASE_DIR / ".env"
 LOCAL_ENV_PATH = BASE_DIR / ".env.local"
-SYSTEM2_ENV_PATH = Path(os.environ.get("COMPETITORSMART_ENV_PATH") or (Path.home() / "Documents" / "New project" / "competitorsmart" / ".env"))
 
 
 INDUSTRY_KEYWORDS = [
@@ -90,6 +77,7 @@ def load_local_env(path: Path) -> None:
     if not path.exists():
         return
     allowed_names = {
+        "MOSS_DATABASE",
         "LLM_PROVIDER",
         "DOUBAO_API_KEY",
         "DOUBAO_ENDPOINT_ID",
@@ -546,11 +534,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     if not (test_config and test_config.get("TESTING")):
         load_local_env(ENV_PATH)
         load_local_env(LOCAL_ENV_PATH)
-        load_local_env(SYSTEM2_ENV_PATH)
+        # 外部配置仅在显式指定时读取，不依赖开发机器上的其他项目。
+        extra_env_path = os.environ.get("MOSS_ENV_PATH")
+        if extra_env_path:
+            load_local_env(Path(extra_env_path).expanduser())
     api_token = os.environ.get("API_TOKEN", "")
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config.update(
-        DATABASE=str(DEFAULT_DB),
+        DATABASE=str(Path(os.environ.get("MOSS_DATABASE") or DEFAULT_DB)),
         MAX_CONTENT_LENGTH=25 * 1024 * 1024,
         JSON_AS_ASCII=False,
         SECRET_KEY=os.environ.get("FLASK_SECRET_KEY", uuid.uuid4().hex),
@@ -2524,15 +2515,12 @@ def build_report_pdf(task_id: str, report: dict[str, Any]):
 
 
 def ensure_pdf_dependency_paths() -> None:
-    import site
-    import sys
+    """检查当前 Python 环境的 PDF 依赖，不混用其他安装目录。"""
+    from importlib.util import find_spec
 
-    candidates = [site.getusersitepackages()]
-    bundled = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / "dependencies" / "python" / "Lib" / "site-packages"
-    candidates.append(str(bundled))
-    for candidate in candidates:
-        if candidate and Path(candidate).exists() and candidate not in sys.path:
-            sys.path.append(candidate)
+    missing = [name for name in ("reportlab", "pypdf") if find_spec(name) is None]
+    if missing:
+        raise RuntimeError("PDF dependencies missing; run python -m pip install -r requirements.txt")
 
 
 def format_date_for_pdf(value: str) -> str:

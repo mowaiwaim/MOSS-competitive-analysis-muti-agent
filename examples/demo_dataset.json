@@ -1,0 +1,118 @@
+{
+  "dataset_note": "缓存样例用于演示 Schema、溯源、质检打回和人工复查闭环；价格、政策、API 能力等易变信息在正式报告中标注为需实时核验。",
+  "competitors": [
+    {
+      "name": "飞书",
+      "website": "https://www.feishu.cn/",
+      "target_users": ["中大型组织", "需要协同办公与组织管理的团队"],
+      "sources": [
+        {
+          "source_id": "src_feishu_official",
+          "source_type": "cached_public_page",
+          "title": "飞书官网产品能力缓存摘录",
+          "url_or_path": "https://www.feishu.cn/",
+          "author_site": "飞书官网",
+          "published_at": "",
+          "credibility": "high",
+          "excerpt": "缓存摘录显示，飞书围绕即时沟通、云文档、视频会议、审批与日历等能力组织一体化协同办公入口。"
+        },
+        {
+          "source_id": "src_feishu_reviews",
+          "source_type": "cached_review_summary",
+          "title": "飞书公开用户评价缓存摘要",
+          "url_or_path": "examples/demo_dataset.json#feishu_reviews",
+          "author_site": "公开评价缓存样例",
+          "published_at": "",
+          "credibility": "medium",
+          "excerpt": "评价缓存摘要提到，用户认可一体化协同体验，也会关注迁移成本、组织配置复杂度和跨团队使用习惯。"
+        }
+      ]
+    },
+    {
+      "name": "Notion",
+      "website": "https://www.notion.com/",
+      "target_users": ["知识工作者", "产品与项目团队", "轻量知识库用户"],
+      "sources": [
+        {
+          "source_id": "src_notion_official",
+          "source_type": "cached_public_page",
+          "title": "Notion 官网产品能力缓存摘录",
+          "url_or_path": "https://www.notion.com/",
+          "author_site": "Notion 官网",
+          "published_at": "",
+          "credibility": "high",
+          "excerpt": "缓存摘录显示，Notion 强调文档、知识库、项目管理和轻量数据库组合，适合从个人到团队的知识组织场景。"
+        },
+        {
+          "source_id": "src_notion_pricing",
+          "source_type": "cached_public_page",
+          "title": "Notion 定价页缓存摘录",
+          "url_or_path": "https://www.notion.com/pricing",
+          "author_site": "Notion 官网",
+          "published_at": "",
+          "credibility": "high",
+          "excerpt": "定价缓存只记录套餐分层存在，不记录当前具体金额；最终价格结论必须实时核验。"
+        }
+      ]
+    },
+    {
+      "name": "Airtable",
+      "website": "https://www.airtable.com/",
+      "target_users": ["业务运营团队", "低代码应用搭建者", "项目与流程管理团队"],
+      "sources": [
+        {
+          "source_id": "src_airtable_official",
+          "source_type": "cached_public_page",
+          "title": "Airtable 官网产品能力缓存摘录",
+          "url_or_path": "https://www.airtable.com/",
+          "author_site": "Airtable 官网",
+          "published_at": "",
+          "credibility": "high",
+          "excerpt": "缓存摘录显示，Airtable 将表格、数据库、自动化和界面搭建结合，面向业务团队构建轻量流程应用。"
+        },
+        {
+          "source_id": "src_airtable_reviews",
+          "source_type": "cached_review_summary",
+          "title": "Airtable 公开用户评价缓存摘要",
+          "url_or_path": "examples/demo_dataset.json#airtable_reviews",
+          "author_site": "公开评价缓存样例",
+          "published_at": "",
+          "credibility": "medium",
+          "excerpt": "评价缓存摘要提到，用户喜欢灵活建模和自动化能力，也会关注权限治理、复杂流程维护和成本可控性。"
+        }
+      ]
+    }
+  ],
+  "shared_sources": [
+    {
+      "source_id": "src_demo_scope_note",
+      "source_type": "demo_scope_note",
+      "title": "缓存样例范围说明",
+      "url_or_path": "examples/demo_dataset.json#dataset_note",
+      "author_site": "项目样例数据",
+      "published_at": "2026-05-22",
+      "credibility": "medium",
+      "excerpt": "缓存样例用于演示稳定流程；价格、政策、API 能力、权限治理等易变或高价值结论需要实时核验或人工确认。"
+    }
+  ],
+  "feature_matrix": [
+    {
+      "feature": "知识沉淀",
+      "feishu": "云文档和协作空间",
+      "notion": "文档、知识库和数据库页面",
+      "airtable": "表格数据库和视图"
+    },
+    {
+      "feature": "流程协同",
+      "feishu": "审批、会议、日历与消息串联",
+      "notion": "项目管理与模板驱动",
+      "airtable": "自动化、接口和低代码界面"
+    },
+    {
+      "feature": "适配重点",
+      "feishu": "组织级一体化办公",
+      "notion": "轻量知识管理和项目协作",
+      "airtable": "结构化业务流程与数据协作"
+    }
+  ]
+}

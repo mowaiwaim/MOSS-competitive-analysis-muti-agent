@@ -1,0 +1,104 @@
+{
+  "as_of": "2026-09-10",
+  "token_budget": 80,
+  "sources": [
+    {
+      "id": "source-a",
+      "url": "https://example.invalid/source-a",
+      "origin_id": "source-a",
+      "content": "A-Pro-v1：美国区，单席位月付，每月20美元，自2026-09-01起生效。",
+      "version_hash": "288664fa9a05ae0c03df41026c1be0df64ac74b43192e27a837b54ba3e3db2e4",
+      "published_at": "2026-09-01",
+      "observed_at": "2026-09-01",
+      "credibility_tier": 2
+    },
+    {
+      "id": "source-b",
+      "url": "https://example.invalid/source-b",
+      "origin_id": "source-b",
+      "content": "B-Team-v2：美国区，单席位月付，每月22美元，自2026-09-01起生效。",
+      "version_hash": "1ab34471acf52d570027f0adc3db774ea8dc9d312061ee6c7786bf750eb39c5b",
+      "published_at": "2026-09-01",
+      "observed_at": "2026-09-01",
+      "credibility_tier": 2
+    }
+  ],
+  "comparisons": [
+    {
+      "id": "a-vs-b",
+      "left_competitor": "A",
+      "right_competitor": "B",
+      "left_offer_id": "A-Pro-v1",
+      "right_offer_id": "B-Team-v2",
+      "dimension": "price",
+      "scope": {
+        "region": "US",
+        "billing_cycle": "monthly",
+        "seats": 1
+      },
+      "unit": "USD/month",
+      "valid_at": "2026-09-10"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "A-fact",
+      "kind": "fact",
+      "competitor": "A",
+      "offer_id": "A-Pro-v1",
+      "dimension": "price",
+      "scope": {
+        "region": "US",
+        "billing_cycle": "monthly",
+        "seats": 1
+      },
+      "unit": "USD/month",
+      "normalized_value": 20,
+      "source_id": "source-a",
+      "source_version_hash": "288664fa9a05ae0c03df41026c1be0df64ac74b43192e27a837b54ba3e3db2e4",
+      "quote": "A-Pro-v1：美国区，单席位月付，每月20美元，自2026-09-01起生效。",
+      "token_cost": 40,
+      "review": {
+        "value_supported": true,
+        "scope_supported": true,
+        "normalization_verified": true,
+        "validity_verified": true
+      },
+      "valid_from": "2026-09-01",
+      "valid_until": null,
+      "support_ids": []
+    },
+    {
+      "id": "B-fact",
+      "kind": "fact",
+      "competitor": "B",
+      "offer_id": "B-Team-v2",
+      "dimension": "price",
+      "scope": {
+        "region": "US",
+        "billing_cycle": "monthly",
+        "seats": 1
+      },
+      "unit": "USD/month",
+      "normalized_value": 22,
+      "source_id": "source-b",
+      "source_version_hash": "1ab34471acf52d570027f0adc3db774ea8dc9d312061ee6c7786bf750eb39c5b",
+      "quote": "B-Team-v2：美国区，单席位月付，每月22美元，自2026-09-01起生效。",
+      "token_cost": 40,
+      "review": {
+        "value_supported": true,
+        "scope_supported": true,
+        "normalization_verified": true,
+        "validity_verified": true
+      },
+      "valid_from": "2026-09-01",
+      "valid_until": null,
+      "support_ids": []
+    }
+  ],
+  "metadata": {
+    "example_only": true,
+    "source_kind": "constructed_for_interface_documentation",
+    "not_an_effectiveness_experiment": true
+  }
+}

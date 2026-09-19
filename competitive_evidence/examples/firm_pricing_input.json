@@ -1,0 +1,65 @@
+{
+  "metadata": {
+    "synthetic": true,
+    "purpose": "竞品选型调用示例，产品、费用及来源均为虚构，不是效果实验"
+  },
+  "problem": {
+    "hard_constraints_prechecked": true,
+    "sources": [
+      {
+        "id": "pricing-fixture",
+        "uri": "fixture://firm/monthly-pricing",
+        "kind": "synthetic_fixture",
+        "content": "虚构业务规格：10席位、美国区、美元、按月付款。A、B、C都已确认满足全部必需功能。A总月成本200，B总月成本可能为160或240，C总月成本可能为300或340。仅按月总成本选型，效用等于成本的相反数。两个查询分别核验B和C在上述条件下的总月成本，预计调用成本均为1。所有可能价格组合在此示例中显式列举。"
+      }
+    ],
+    "decisions": [
+      {"id": "A", "label": "虚构产品A"},
+      {"id": "B", "label": "虚构产品B"},
+      {"id": "C", "label": "虚构产品C"}
+    ],
+    "scenarios": [
+      {"id": "b160_c300", "label": "B月成本160，C月成本300", "source_ids": ["pricing-fixture"]},
+      {"id": "b160_c340", "label": "B月成本160，C月成本340", "source_ids": ["pricing-fixture"]},
+      {"id": "b240_c300", "label": "B月成本240，C月成本300", "source_ids": ["pricing-fixture"]},
+      {"id": "b240_c340", "label": "B月成本240，C月成本340", "source_ids": ["pricing-fixture"]}
+    ],
+    "utility": {
+      "description": "已满足硬性需求的产品按总月成本选型，效用=-成本，遗憾单位为美元/月。",
+      "source_ids": ["pricing-fixture"],
+      "values": {
+        "b160_c300": {"A": -200, "B": -160, "C": -300},
+        "b160_c340": {"A": -200, "B": -160, "C": -340},
+        "b240_c300": {"A": -200, "B": -240, "C": -300},
+        "b240_c340": {"A": -200, "B": -240, "C": -340}
+      }
+    },
+    "queries": [
+      {
+        "id": "verify-b-monthly-cost",
+        "tool": "evidence.verify",
+        "args": {"competitor": "B", "question": "核验B满足全部必需功能、10席位、美国区、按月付款时的总月成本，并返回原文证据。"},
+        "scope": {"competitor": "B", "seats": 10, "region": "US", "currency": "USD", "billing": "monthly"},
+        "cost": 1,
+        "source_ids": ["pricing-fixture"],
+        "outcomes": [
+          {"id": "b160", "scenario_ids": ["b160_c300", "b160_c340"], "source_ids": ["pricing-fixture"], "description": "B在目标使用条件下总月成本160美元"},
+          {"id": "b240", "scenario_ids": ["b240_c300", "b240_c340"], "source_ids": ["pricing-fixture"], "description": "B在目标使用条件下总月成本240美元"}
+        ]
+      },
+      {
+        "id": "verify-c-monthly-cost",
+        "tool": "evidence.verify",
+        "args": {"competitor": "C", "question": "核验C满足全部必需功能、10席位、美国区、按月付款时的总月成本，并返回原文证据。"},
+        "scope": {"competitor": "C", "seats": 10, "region": "US", "currency": "USD", "billing": "monthly"},
+        "cost": 1,
+        "source_ids": ["pricing-fixture"],
+        "outcomes": [
+          {"id": "c300", "scenario_ids": ["b160_c300", "b240_c300"], "source_ids": ["pricing-fixture"], "description": "C在目标使用条件下总月成本300美元"},
+          {"id": "c340", "scenario_ids": ["b160_c340", "b240_c340"], "source_ids": ["pricing-fixture"], "description": "C在目标使用条件下总月成本340美元"}
+        ]
+      }
+    ]
+  },
+  "config": {"budget": 4, "max_calls": 4, "max_failures": 2, "regret_threshold": 0, "min_gain": 0, "lookahead": 2}
+}

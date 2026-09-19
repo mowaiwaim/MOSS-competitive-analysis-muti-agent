@@ -6,14 +6,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-
-
-DEFAULT_LARK_CLI_RELATIVE_PATH = (
-    "Microsoft\\WinGet\\Packages\\OpenJS.NodeJS.LTS_Microsoft.Winget.Source_8wekyb3d8bbwe\\"
-    "node-v24.16.0-win-x64\\lark-cli.cmd"
-)
 
 
 class FeishuPublishError(RuntimeError):
@@ -43,12 +36,6 @@ def resolve_feishu_cli_path(cli_path: str | None = None) -> str:
     explicit = (cli_path or os.environ.get("FEISHU_CLI_PATH") or os.environ.get("LARK_CLI_PATH") or "").strip()
     if explicit:
         return os.path.expandvars(explicit)
-
-    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_app_data:
-        candidate = Path(local_app_data) / DEFAULT_LARK_CLI_RELATIVE_PATH
-        if candidate.exists():
-            return str(candidate)
 
     return shutil.which("lark-cli") or shutil.which("feishu") or "lark-cli"
 
