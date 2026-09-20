@@ -1,6 +1,6 @@
 # MOSS多agent智能竞品分析系统——小莫
 
-MOSS团队小莫项目。系统面向竞品分析场景，支持从竞品输入、公开资料采集、Agent 分析、质检复核、可视化展示到 PDF 报告导出的端到端流程。
+MOSS团队多智能体竞品分析系统。系统面向竞品分析场景，支持从竞品输入、公开资料采集、Agent 分析、质检复核、可视化展示到 PDF 报告导出的端到端流程。
 
 ## 核心功能
 
@@ -39,33 +39,11 @@ copy .env.example .env
 
 编辑 `.env`，填入自己的 API Key 和 RSS 地址后启动：
 
-```powershell
-python -m flask --app app run --host 127.0.0.1 --port 5016
-```
-
-浏览器访问：
-
-```text
-http://127.0.0.1:5016
-```
 
 使用截图工具时，另行执行 `python -m playwright install chromium`。模型、联网采集和飞书发布需要各自的配置或授权。公共配置随代码提供，不需要其他本地项目目录。
 
 `requirements.lock.txt` 固定本次验证过的依赖版本。`requirements.txt` 保留直接依赖范围，升级后需重新验证并更新锁定文件。
 
-## CAPER 与 FIRM-ReAct Skills
-
-- [CAPER 同口径配对证据重排](skills/moss-caper/SKILL.md)：按比较收益与新增证据成本选择完整双边证据包，保留缺证和冲突。
-- [FIRM-ReAct 证伪引导的最小遗憾策略](skills/moss-firm-react/SKILL.md)：计算显式情形下的选型风险，以最多两步前瞻选择核验动作，并记录真实观察与费用。
-
-两个 Skill 复用 `competitive_evidence/` 的 Python 实现。当前为独立调用入口，尚未自动接入网页中的采集、分析或质检节点。完整机制、字段和核验要求见[算法说明](competitive_evidence/ALGORITHMS.md)。
-
-```powershell
-python skills/moss-caper/scripts/run.py --input competitive_evidence/examples/caper_input.json
-python skills/moss-firm-react/scripts/run.py plan --input competitive_evidence/examples/firm_pricing_input.json
-```
-
-示例均为合成输入，功能测试不代表实际模型效果提升。Skill 目录与仓库一起使用，不单独复制算法副本。
 
 ## 环境变量
 
@@ -111,8 +89,3 @@ python skills/moss-firm-react/scripts/run.py plan --input competitive_evidence/e
 python -m pytest tests -q
 ```
 
-## 安全说明
-
-- `.env`、数据库、日志、缓存、生成 PDF 和本地上传材料默认不提交。
-- GitHub 仓库不包含 API Key、Cookie、Bearer Token 或本地任务数据。
-- 如果误把密钥推送到公开仓库，请立即在对应平台作废并重新生成 Key。
